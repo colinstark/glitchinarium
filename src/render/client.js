@@ -150,9 +150,17 @@ function makeLocalFallback() {
       const source = stickySource ?? job.sourceBuf;
       if (!source) throw new Error("render: missing source buffer");
 
-      // Local path has no sticky DTO — always needs a full layer list.
-      const layers = job.layers ?? [];
-      if (!layers.length) throw new Error("render: missing layer stack");
+      // Local path has no sticky DTO — needs an explicit layer array.
+      // Empty stack is valid (identity / cleared stack → source passthrough).
+      // `undefined` layers is only for worker sticky patches.
+      if (job.layers == null) {
+        throw new Error(
+          job.layerPatch
+            ? "render: layer patch requires worker sticky DTO"
+            : "render: missing layer stack"
+        );
+      }
+      const layers = job.layers;
       const ctx = createContext({
         renderW: job.renderW,
         renderH: job.renderH,
