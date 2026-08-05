@@ -23,6 +23,34 @@ const el = (tag, cls, text) => {
 const prettify = (s) => s.replace(/-/g, " ").replace(/^./, (c) => c.toUpperCase());
 
 /**
+ * Mark the app as scrubbing a range control so preview can drop resolution
+ * and coalesce to rAF. Dispatched as a document event (controls stay free of
+ * main.js imports).
+ */
+export function emitScrub(active) {
+  if (typeof document === "undefined") return;
+  document.dispatchEvent(
+    new CustomEvent("glitchinarium:scrub", { detail: { active: !!active } })
+  );
+}
+
+/** Wire pointer-driven scrub start/end on a range (or similar) input. */
+export function attachScrubEvents(input) {
+  if (!input) return input;
+  const start = () => emitScrub(true);
+  const end = () => emitScrub(false);
+  input.addEventListener("pointerdown", start);
+  input.addEventListener("pointerup", end);
+  input.addEventListener("pointercancel", end);
+  input.addEventListener("lostpointercapture", end);
+  // Keyboard / accessibility: treat focus-driven input as light scrub.
+  input.addEventListener("keydown", start);
+  input.addEventListener("keyup", end);
+  input.addEventListener("blur", end);
+  return input;
+}
+
+/**
  * Build controls for `schema` bound to `params`.
  * Returns { root, refresh } — call refresh() to re-apply showIf visibility.
  */
@@ -253,7 +281,7 @@ function buildInput(def, params, commit, ctxHint) {
       input.step = def.step ?? 1;
       input.value = params[def.key];
       input.addEventListener("input", () => commit(Number(input.value)));
-      return input;
+      return attachScrubEvents(input);
     }
 
     case "toggle": {

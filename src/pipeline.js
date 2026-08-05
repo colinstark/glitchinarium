@@ -68,11 +68,17 @@ export function createLayer(type, overrides = {}) {
 }
 
 /**
- * Hint that a layer's params changed. Call-sites use this for clarity; the
- * fingerprint always rebuilds from live params so direct mutations stay safe.
+ * Last layer the UI marked dirty — used for worker sticky param patches so
+ * slider previews do not re-clone the whole stack DTO every frame.
  */
-export function touchLayerKey(_layer) {
-  /* no-op: layerKey reads live params each render */
+export let liveEditLayerId = null;
+
+/**
+ * Hint that a layer's params changed. Fingerprint still rebuilds from live
+ * params; we also record which layer was edited for live IPC patches.
+ */
+export function touchLayerKey(layer) {
+  if (layer?.id) liveEditLayerId = layer.id;
 }
 
 /**

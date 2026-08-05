@@ -14,11 +14,13 @@ import {
   workerSupported,
   installRenderWorker,
   paintLayerPatch,
+  layerLivePatch,
 } from "./render/client.js";
 import { createLayerStack } from "./ui/layers.js";
 import { pickFile } from "./ui/controls.js";
 import { brushState, attachBrush, onBrushChange, endPaint } from "./ui/brush.js";
 import { randomizeParams, randomizeStack, SCOPES } from "./ui/randomize.js";
+import { liveEditLayerId } from "./pipeline.js";
 import {
   BUILTIN,
   instantiate,
@@ -241,16 +243,25 @@ let previewSeq = 0;
 /** Serialise preview runs so two jobs never race on the stage canvas. */
 let previewChain = Promise.resolve();
 const PAINT_PREVIEW_EDGE = 540;
-/** Trailing debounce for slider/stack edits (ms). */
+/** Long-edge while dragging a slider — cheap enough to re-run the stack live. */
+const SCRUB_PREVIEW_EDGE = 520;
+/** Trailing debounce for non-scrub slider/stack edits (ms). */
 const PREVIEW_DEBOUNCE_MS = 40;
+/** Settle debounce after scrub ends before full-res preview (ms). */
+const SCRUB_SETTLE_MS = 80;
+
+/** True while a range control is being dragged (or key-held). */
+let scrubActive = false;
 
 /**
- * Preview long-edge budget. Scale with DPR so retina stages are not just a
- * soft upscale of a 1× buffer (paint stays cheaper than full preview).
+ * Preview long-edge budget.
+ * - Paint / scrub: lower edge for interactive feel
+ * - Idle: scale with DPR so retina is not a soft upscale of a 1× buffer
  */
 function previewMaxEdge(painting) {
   const dpr = stageDevicePixelRatio();
   if (painting) return Math.round(PAINT_PREVIEW_EDGE * Math.min(dpr, 1.5));
+  if (scrubActive) return Math.round(SCRUB_PREVIEW_EDGE * Math.min(dpr, 1.5));
   return Math.round(PREVIEW_EDGE * Math.min(dpr, 2));
 }
 
@@ -273,14 +284,15 @@ function enqueuePreview() {
 
 /**
  * Schedule a preview re-render.
- * - Paint: coalesce to one rAF (pointermove flood → single latest job)
- * - Everything else: trailing debounce so sliders stay smooth
+ * - Paint / scrub: coalesce to one rAF (input flood → single latest job)
+ * - Everything else: trailing debounce so discrete edits stay smooth
  */
 function scheduleRender() {
   updateExportMeta();
 
-  if (brushState.active) {
-    // Drop trailing slider timer; paint path owns the schedule now.
+  const interactive = brushState.active || scrubActive;
+
+  if (interactive) {
     if (pending) {
       clearTimeout(pending);
       pending = null;
@@ -304,12 +316,33 @@ function scheduleRender() {
   }, PREVIEW_DEBOUNCE_MS);
 }
 
-/** Drop layer cache (worker + local fallback). Optionally drop sticky source. */
-function invalidateCache({ clearSource = false } = {}) {
-  state.workerHasSource = clearSource ? false : state.workerHasSource;
-  // Stack / params may change — sticky DTO is no longer trustworthy.
-  state.workerHasLayers = false;
-  renderClient.invalidateCache({ clearSource, clearLayers: true });
+document.addEventListener("glitchinarium:scrub", (e) => {
+  const on = !!e.detail?.active;
+  if (on === scrubActive) return;
+  scrubActive = on;
+  if (!on && state.image) {
+    // Drop interactive rAF and settle at full preview resolution.
+    if (pendingPaintRaf) {
+      cancelAnimationFrame(pendingPaintRaf);
+      pendingPaintRaf = 0;
+    }
+    if (pending) clearTimeout(pending);
+    pending = setTimeout(() => {
+      pending = null;
+      enqueuePreview();
+    }, SCRUB_SETTLE_MS);
+  }
+});
+
+/**
+ * Drop layer cache (worker + local fallback). Optionally drop sticky source
+ * and/or sticky layer DTO. Source size changes should keep the layer DTO —
+ * params are artwork-unit and stay valid across preview resolutions.
+ */
+function invalidateCache({ clearSource = false, clearLayers = true } = {}) {
+  if (clearSource) state.workerHasSource = false;
+  if (clearLayers) state.workerHasLayers = false;
+  renderClient.invalidateCache({ clearSource, clearLayers });
 }
 
 /** Merge worker mask payload into sticky lastMasks (supports deltas). */
@@ -399,7 +432,8 @@ async function renderPreview(seq) {
     );
     state.cacheKey = sourceKey;
     state.workerHasSource = false;
-    invalidateCache({ clearSource: true });
+    // Keep sticky layer DTO across scrub/full size flips — only drop source cache.
+    invalidateCache({ clearSource: true, clearLayers: false });
     sendSource = true;
   } else if (!state.workerHasSource || !state.previewSource) {
     if (!state.previewSource) {
@@ -422,12 +456,30 @@ async function renderPreview(seq) {
     return;
   }
 
-  // Paint-fast + sticky worker layers: send only stroke patch (not full DTO).
+  // Sticky worker layers: paint sends strokes only; sliders send one-layer patch.
   const usePaintPatch =
     paintFast &&
     renderClient.supported &&
     state.workerHasLayers &&
     !!paintLayer;
+
+  const editLayer =
+    !paintFast && liveEditLayerId
+      ? state.layers.find((l) => l.id === liveEditLayerId)
+      : null;
+  const useLivePatch =
+    !usePaintPatch &&
+    !!editLayer &&
+    renderClient.supported &&
+    state.workerHasLayers;
+
+  // Masks only when overlay/paint needs them — skip transfer while scrubbing params.
+  const needMasks =
+    paintFast ||
+    !!brushState.layer ||
+    !!state.previewMaskId;
+
+  const scrubbing = scrubActive && !painting;
 
   const result = await renderClient.renderJob(
     {
@@ -435,12 +487,17 @@ async function renderPreview(seq) {
       sourceBuf: state.previewSource,
       sourceKey,
       sendSource,
-      layers: usePaintPatch
-        ? undefined
-        : paintFast
-          ? state.layers.slice(0, paintIndex + 1)
-          : state.layers,
-      layerPatch: usePaintPatch ? paintLayerPatch(paintLayer) : null,
+      layers:
+        usePaintPatch || useLivePatch
+          ? undefined
+          : paintFast
+            ? state.layers.slice(0, paintIndex + 1)
+            : state.layers,
+      layerPatch: usePaintPatch
+        ? paintLayerPatch(paintLayer)
+        : useLivePatch
+          ? layerLivePatch(editLayer)
+          : null,
       seed: state.seed,
       ssaa: 1,
       renderW: plan.renderW,
@@ -449,12 +506,13 @@ async function renderPreview(seq) {
       endIndex: paintFast ? paintIndex + 1 : undefined,
       skipCache: paintFast,
       useCache: !paintFast,
-      returnMasks: true,
+      returnMasks: needMasks,
       paintOnly: paintFast,
       maskDeltas: true,
       maskIds: paintFast && paintLayer ? [paintLayer.id] : null,
       preferBitmap: true,
-      yieldMs: paintFast ? 32 : 8,
+      // Fewer yields while scrubbing — progress is not shown mid-drag.
+      yieldMs: paintFast || scrubbing ? 32 : 8,
     },
     {
       shouldAbort: () => seq !== previewSeq || state.rendering,
@@ -468,10 +526,10 @@ async function renderPreview(seq) {
 
   if (sendSource) state.workerHasSource = true;
   // Full DTO landed on the worker (or local). Patches keep sticky.
-  if (!usePaintPatch) state.workerHasLayers = renderClient.supported;
+  if (!usePaintPatch && !useLivePatch) state.workerHasLayers = renderClient.supported;
 
   const ms = performance.now() - t0;
-  mergeMasks(result);
+  if (needMasks) mergeMasks(result);
   applyPreviewPixels(result);
   paintStage();
 
@@ -480,7 +538,9 @@ async function renderPreview(seq) {
   setStatus(
     paintFast
       ? `paint · ${plan.renderW}×${plan.renderH} · ${ms.toFixed(0)} ms · ${backend}`
-      : `${plan.renderW}×${plan.renderH} preview · ${active}/${state.layers.length} layers · ${ms.toFixed(0)} ms · ${backend}`
+      : scrubbing
+        ? `scrub · ${plan.renderW}×${plan.renderH} · ${ms.toFixed(0)} ms · ${backend}`
+        : `${plan.renderW}×${plan.renderH} preview · ${active}/${state.layers.length} layers · ${ms.toFixed(0)} ms · ${backend}`
   );
 }
 

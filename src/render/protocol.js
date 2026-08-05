@@ -47,8 +47,8 @@ export function layersToDTO(layers, endIndex = layers.length) {
 }
 
 /**
- * Paint-fast patch: only the strokes (and optional param fields) for one mask
- * layer. Worker merges onto its sticky layer DTO.
+ * Paint-fast patch: only the strokes for one mask layer.
+ * Worker merges onto its sticky layer DTO.
  */
 export function paintLayerPatch(layer) {
   if (!layer) return null;
@@ -57,6 +57,25 @@ export function paintLayerPatch(layer) {
     params: {
       strokes: structuredClone(layer.params?.strokes ?? []),
     },
+  };
+}
+
+/**
+ * Full live patch for one layer (slider / opacity / mask chrome).
+ * Replaces params+mods on the worker sticky DTO for that id.
+ */
+export function layerLivePatch(layer) {
+  if (!layer) return null;
+  return {
+    id: layer.id,
+    enabled: layer.enabled !== false,
+    opacity: layer.opacity ?? 1,
+    blend: layer.blend ?? "normal",
+    mask: layer.mask ?? null,
+    maskInvert: !!layer.maskInvert,
+    maskFeather: layer.maskFeather ?? 0,
+    params: structuredClone(layer.params ?? {}),
+    mods: structuredClone(layer.mods ?? {}),
   };
 }
 

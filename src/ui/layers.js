@@ -13,7 +13,7 @@
 import { PROCESSORS, processorsByCategory } from "../processors/index.js";
 import { createLayer, availableMasks, touchLayerKey } from "../pipeline.js";
 import { BLEND_MODES } from "../buffer.js";
-import { buildControls } from "./controls.js";
+import { buildControls, attachScrubEvents } from "./controls.js";
 import { randomizeLayer } from "./randomize.js";
 import { beginPaint, endPaint, brushState } from "./brush.js";
 
@@ -318,6 +318,7 @@ export function createLayerStack({
             touchLayerKey(layer);
             onChange();
           });
+          attachScrubEvents(op);
           comp.append(labelled("Opacity", op, opOut));
 
           // Compact mask row: select (or empty placeholder) + insert-above.
@@ -401,6 +402,7 @@ export function createLayerStack({
               touchLayerKey(layer);
               onChange();
             });
+            attachScrubEvents(feather);
             comp.append(labelled("Feather", feather, fOut));
           }
 

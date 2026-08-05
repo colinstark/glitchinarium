@@ -192,7 +192,7 @@ self.onmessage = async (ev) => {
           maskStamps = new Map();
         }
 
-        // Layers: full DTO replaces sticky; paint patch merges strokes.
+        // Layers: full DTO replaces sticky; patch merges onto one sticky layer.
         let layers;
         if (job.layers) {
           stickyLayers = job.layers;
@@ -200,9 +200,22 @@ self.onmessage = async (ev) => {
         } else if (job.layerPatch && stickyLayers) {
           const patch = job.layerPatch;
           const target = stickyLayers.find((l) => l.id === patch.id);
-          if (target && patch.params) {
-            Object.assign(target.params, patch.params);
-            target._keyDirty = true;
+          if (target) {
+            if (patch.enabled !== undefined) target.enabled = patch.enabled;
+            if (patch.opacity !== undefined) target.opacity = patch.opacity;
+            if (patch.blend !== undefined) target.blend = patch.blend;
+            if (patch.mask !== undefined) target.mask = patch.mask;
+            if (patch.maskInvert !== undefined) target.maskInvert = patch.maskInvert;
+            if (patch.maskFeather !== undefined) target.maskFeather = patch.maskFeather;
+            if (patch.params) {
+              // Full replace for slider patches; shallow merge for stroke-only paint.
+              if (patch.params.strokes != null && Object.keys(patch.params).length === 1) {
+                Object.assign(target.params, patch.params);
+              } else {
+                target.params = patch.params;
+              }
+            }
+            if (patch.mods) target.mods = patch.mods;
           }
           layers = stickyLayers;
         } else if (stickyLayers) {

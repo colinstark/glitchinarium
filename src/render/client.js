@@ -9,7 +9,13 @@
  * Preview/export never hard-fail solely because the worker is unavailable.
  */
 
-import { MSG, layersToDTO, paintLayerPatch, workerSupported } from "./protocol.js";
+import {
+  MSG,
+  layersToDTO,
+  paintLayerPatch,
+  layerLivePatch,
+  workerSupported,
+} from "./protocol.js";
 import { bufFromDrawable, bufToTransfer, createBuf } from "../buffer.js";
 import { createContext } from "../context.js";
 import { renderAsync } from "../pipeline.js";
@@ -618,4 +624,4 @@ export function decodeSource(drawable, w, h) {
   return bufFromDrawable(drawable, w, h);
 }
 
-export { workerSupported, createBuf, paintLayerPatch };
+export { workerSupported, createBuf, paintLayerPatch, layerLivePatch };
