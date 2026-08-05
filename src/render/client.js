@@ -9,7 +9,7 @@
  * Preview/export never hard-fail solely because the worker is unavailable.
  */
 
-import { MSG, layersToDTO, workerSupported } from "./protocol.js";
+import { MSG, layersToDTO, paintLayerPatch, workerSupported } from "./protocol.js";
 import { bufFromDrawable, bufToTransfer, createBuf } from "../buffer.js";
 import { createContext } from "../context.js";
 import { renderAsync } from "../pipeline.js";
@@ -144,7 +144,9 @@ function makeLocalFallback() {
       const source = stickySource ?? job.sourceBuf;
       if (!source) throw new Error("render: missing source buffer");
 
+      // Local path has no sticky DTO — always needs a full layer list.
       const layers = job.layers ?? [];
+      if (!layers.length) throw new Error("render: missing layer stack");
       const ctx = createContext({
         renderW: job.renderW,
         renderH: job.renderH,
@@ -201,13 +203,26 @@ function makeLocalFallback() {
       if (job.paintOnly) {
         return {
           buf: null,
+          bitmap: null,
           masks,
+          unchangedMaskIds: [],
+          removedMaskIds: [],
+          maskDeltas: false,
           renderW: job.renderW,
           renderH: job.renderH,
           paintOnly: true,
         };
       }
-      return { buf: final, masks, renderW: job.renderW, renderH: job.renderH };
+      return {
+        buf: final,
+        bitmap: null,
+        masks,
+        unchangedMaskIds: [],
+        removedMaskIds: [],
+        maskDeltas: false,
+        renderW: job.renderW,
+        renderH: job.renderH,
+      };
     },
   };
 }
@@ -301,7 +316,12 @@ function makeWorkerClient(workerUrl, opts = {}) {
           }
         : null;
       const masks = new Map();
+      const unchangedMaskIds = [];
       for (const m of msg.masks ?? []) {
+        if (m.unchanged) {
+          unchangedMaskIds.push(m.id);
+          continue;
+        }
         masks.set(m.id, {
           w: m.w,
           h: m.h,
@@ -312,7 +332,11 @@ function makeWorkerClient(workerUrl, opts = {}) {
       }
       slot.resolve({
         buf,
+        bitmap: msg.bitmap ?? null,
         masks,
+        unchangedMaskIds,
+        removedMaskIds: msg.removedMaskIds ?? [],
+        maskDeltas: true,
         renderW: msg.renderW,
         renderH: msg.renderH,
         paintOnly: !!msg.paintOnly,
@@ -365,7 +389,12 @@ function makeWorkerClient(workerUrl, opts = {}) {
     invalidateCache(opts = {}) {
       if (dead) return;
       try {
-        worker.postMessage({ type: MSG.INVALIDATE, clearSource: !!opts.clearSource });
+        worker.postMessage({
+          type: MSG.INVALIDATE,
+          clearSource: !!opts.clearSource,
+          // Stack identity changed — drop sticky layer DTO + mask stamps.
+          clearLayers: opts.clearLayers !== false,
+        });
       } catch {
         /* dead */
       }
@@ -406,9 +435,16 @@ function makeWorkerClient(workerUrl, opts = {}) {
       }
 
       const id = nextId++;
-      // Paint-fast: only serialise layers that will actually run.
-      const end = job.endIndex ?? job.layers.length;
-      const layers = layersToDTO(job.layers, end);
+      // Paint-fast: only serialise layers that will actually run — or send a
+      // stroke patch against the worker's sticky DTO when requested.
+      const end = job.endIndex ?? job.layers?.length ?? 0;
+      let layers = null;
+      let layerPatch = null;
+      if (job.layerPatch) {
+        layerPatch = job.layerPatch;
+      } else if (job.layers) {
+        layers = layersToDTO(job.layers, end);
+      }
       const transferList = [];
       let sourcePayload = null;
       if (job.sourceBuf && job.sendSource !== false) {
@@ -424,18 +460,22 @@ function makeWorkerClient(workerUrl, opts = {}) {
           source: sourcePayload,
           sourceKey: job.sourceKey ?? null,
           layers,
+          layerPatch,
           seed: job.seed,
           ssaa: job.ssaa,
           renderW: job.renderW,
           renderH: job.renderH,
           interactivePaint: job.interactivePaint,
-          // DTO already truncated — run full DTO length
-          endIndex: undefined,
+          // DTO already truncated — run full DTO length unless patching.
+          endIndex: layers ? undefined : job.endIndex,
           skipCache: job.skipCache,
           useCache: job.useCache,
           invalidateCache: job.invalidateCache,
           returnMasks: job.returnMasks,
           paintOnly: job.paintOnly,
+          maskDeltas: job.maskDeltas !== false,
+          maskIds: job.maskIds ?? null,
+          preferBitmap: job.preferBitmap !== false && job.mode !== "export",
           yieldMs: job.yieldMs,
         },
       };
@@ -560,6 +600,8 @@ function makeResilientClient() {
         }
         active = local;
         mode = "local";
+        // Paint patches need the worker sticky DTO — cannot retry on main alone.
+        if (!job.layers?.length) throw err;
         return runLocal();
       }
     },
@@ -576,4 +618,4 @@ export function decodeSource(drawable, w, h) {
   return bufFromDrawable(drawable, w, h);
 }
 
-export { workerSupported, createBuf };
+export { workerSupported, createBuf, paintLayerPatch };

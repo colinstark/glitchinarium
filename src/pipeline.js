@@ -31,7 +31,13 @@ function cloneMasks(map, prevSnap) {
     if (old && old.data === m.data && old.w === m.w && old.h === m.h) {
       out.set(id, old);
     } else {
-      out.set(id, { w: m.w, h: m.h, data: new Float32Array(m.data), bbox: m.bbox ?? null });
+      out.set(id, {
+        w: m.w,
+        h: m.h,
+        data: new Float32Array(m.data),
+        bbox: m.bbox ?? null,
+        _rev: m._rev ?? null,
+      });
     }
   }
   return out;
@@ -62,8 +68,8 @@ export function createLayer(type, overrides = {}) {
 }
 
 /**
- * Hint that a layer's params changed. Kept for call-site clarity; fingerprint
- * is always rebuilt from live params (see layerKey) so direct mutations stay safe.
+ * Hint that a layer's params changed. Call-sites use this for clarity; the
+ * fingerprint always rebuilds from live params so direct mutations stay safe.
  */
 export function touchLayerKey(_layer) {
   /* no-op: layerKey reads live params each render */
@@ -118,6 +124,15 @@ function layerKey(layer) {
     paramsPart,
     layer.mods,
   ]);
+}
+
+/** True when every pixel of `buf` is fully opaque (alpha 255). */
+function isFullyOpaque(buf) {
+  const d = buf.data;
+  for (let i = 3; i < d.length; i += 4) {
+    if (d[i] < 255) return false;
+  }
+  return true;
 }
 
 /**
@@ -227,11 +242,25 @@ export function* renderSteps(layers, source, ctx, cache = null, opts = {}) {
         } else {
           const out = proc.apply(ctx, acc, layer.params);
           if (out) {
-            compositeInto(acc, out, {
-              mode: layer.blend,
-              opacity: layer.opacity,
-              mask: resolveMask(ctx, layer, derivedCache),
-            });
+            const mask = resolveMask(ctx, layer, derivedCache);
+            const opacity = layer.opacity ?? 1;
+            const blend = layer.blend ?? "normal";
+            // Full replace: skip a whole-frame composite when the layer is a
+            // straight opaque overwrite (common for warps / tone / glitch).
+            if (
+              !mask &&
+              opacity >= 1 &&
+              blend === "normal" &&
+              out !== acc &&
+              out.w === acc.w &&
+              out.h === acc.h &&
+              isFullyOpaque(out)
+            ) {
+              acc = out;
+            } else if (out !== acc) {
+              compositeInto(acc, out, { mode: blend, opacity, mask });
+            }
+            // out === acc: processor mutated in place — nothing to do.
           }
         }
       }

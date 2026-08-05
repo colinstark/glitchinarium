@@ -136,33 +136,31 @@ export function foldCoord(v, n, mode) {
  */
 export function sampleBilinear(buf, x, y, out, edge = "clamp") {
   const { w, h, data } = buf;
-  const x0 = Math.floor(x);
-  const y0 = Math.floor(y);
-  const fx = x - x0;
-  const fy = y - y0;
+  // floor: |0 truncates toward 0 (fine for the common non-negative case).
+  const ix = x < 0 ? Math.floor(x) : x | 0;
+  const iy = y < 0 ? Math.floor(y) : y | 0;
+  const fx = x - ix;
+  const fy = y - iy;
 
-  const xa = foldCoord(x0, w, edge);
-  const xb = foldCoord(x0 + 1, w, edge);
-  const ya = foldCoord(y0, h, edge);
-  const yb = foldCoord(y0 + 1, h, edge);
+  const xa = foldCoord(ix, w, edge);
+  const xb = foldCoord(ix + 1, w, edge);
+  const ya = foldCoord(iy, h, edge);
+  const yb = foldCoord(iy + 1, h, edge);
 
-  const i00 = (ya * w + xa) * 4;
-  const i10 = (ya * w + xb) * 4;
-  const i01 = (yb * w + xa) * 4;
-  const i11 = (yb * w + xb) * 4;
+  const i00 = (ya * w + xa) << 2;
+  const i10 = (ya * w + xb) << 2;
+  const i01 = (yb * w + xa) << 2;
+  const i11 = (yb * w + xb) << 2;
 
   const w00 = (1 - fx) * (1 - fy);
   const w10 = fx * (1 - fy);
   const w01 = (1 - fx) * fy;
   const w11 = fx * fy;
 
-  for (let c = 0; c < 4; c++) {
-    out[c] =
-      data[i00 + c] * w00 +
-      data[i10 + c] * w10 +
-      data[i01 + c] * w01 +
-      data[i11 + c] * w11;
-  }
+  out[0] = data[i00] * w00 + data[i10] * w10 + data[i01] * w01 + data[i11] * w11;
+  out[1] = data[i00 + 1] * w00 + data[i10 + 1] * w10 + data[i01 + 1] * w01 + data[i11 + 1] * w11;
+  out[2] = data[i00 + 2] * w00 + data[i10 + 2] * w10 + data[i01 + 2] * w01 + data[i11 + 2] * w11;
+  out[3] = data[i00 + 3] * w00 + data[i10 + 3] * w10 + data[i01 + 3] * w01 + data[i11 + 3] * w11;
   return out;
 }
 
@@ -325,17 +323,33 @@ export function compositeInto(dst, src, { mode = "normal", opacity = 1, mask = n
     if (x1 < x0 || y1 < y0) return dst;
   }
 
+  // Fast path: full-frame opaque normal replace (no mask, full opacity).
+  if (plain && opacity >= 1 && !maskData && x0 === 0 && y0 === 0 && x1 === w - 1 && y1 === h - 1) {
+    let opaque = true;
+    for (let i = 3; i < s.length; i += 4) {
+      if (s[i] < 255) {
+        opaque = false;
+        break;
+      }
+    }
+    if (opaque) {
+      d.set(s);
+      return dst;
+    }
+  }
+
   for (let y = y0; y <= y1; y++) {
     let p = y * w + x0;
     for (let x = x0; x <= x1; x++, p++) {
-      const i = p * 4;
+      const i = p << 2;
       let coverage = opacity;
       if (maskData) {
         const m = maskData[p];
         coverage *= maskInvert ? 1 - m : m;
       }
-      const sa = Math.max(0, Math.min(1, (s[i + 3] / 255) * coverage));
+      let sa = (s[i + 3] / 255) * coverage;
       if (sa <= 0) continue;
+      if (sa > 1) sa = 1;
 
       if (plain && sa >= 1) {
         d[i] = s[i];
@@ -349,10 +363,15 @@ export function compositeInto(dst, src, { mode = "normal", opacity = 1, mask = n
       // Opaque photographs are the overwhelmingly common path. Source-over then
       // reduces to the original three-channel lerp and needs no alpha division.
       if (da >= 1) {
-        for (let c = 0; c < 3; c++) {
-          const base = d[i + c];
-          const blended = plain ? s[i + c] : blendChannel(mode, base, s[i + c]);
-          d[i + c] = base + (blended - base) * sa;
+        const inv = 1 - sa;
+        if (plain) {
+          d[i] = d[i] * inv + s[i] * sa;
+          d[i + 1] = d[i + 1] * inv + s[i + 1] * sa;
+          d[i + 2] = d[i + 2] * inv + s[i + 2] * sa;
+        } else {
+          d[i] = d[i] + (blendChannel(mode, d[i], s[i]) - d[i]) * sa;
+          d[i + 1] = d[i + 1] + (blendChannel(mode, d[i + 1], s[i + 1]) - d[i + 1]) * sa;
+          d[i + 2] = d[i + 2] + (blendChannel(mode, d[i + 2], s[i + 2]) - d[i + 2]) * sa;
         }
         continue;
       }
@@ -365,18 +384,16 @@ export function compositeInto(dst, src, { mode = "normal", opacity = 1, mask = n
       }
 
       const outA = sa + da * (1 - sa);
+      const invOut = outA > 0 ? 1 / outA : 0;
       for (let c = 0; c < 3; c++) {
         const base = d[i + c];
         const source = s[i + c];
         const blended = plain ? source : blendChannel(mode, base, source);
         // W3C source-over blending in premultiplied form, converted back to the
-        // straight-alpha representation used by ImageData. In particular, RGB
-        // must not be attenuated when painting onto a transparent destination.
+        // straight-alpha representation used by ImageData.
         const premult =
-          sa * (1 - da) * source +
-          sa * da * blended +
-          (1 - sa) * da * base;
-        d[i + c] = outA > 0 ? premult / outA : 0;
+          sa * (1 - da) * source + sa * da * blended + (1 - sa) * da * base;
+        d[i + c] = premult * invOut;
       }
       d[i + 3] = outA * 255;
     }
@@ -400,51 +417,91 @@ export function fillBuf(buf, r, g, b, a = 255) {
  * Separable box blur on an RGBA buffer, radius in pixels. Two passes so it
  * approximates a gaussian; used by glow and by CRT phosphor bleed.
  */
+/** Reused scratch for boxBlurBuf — avoids allocating a full-frame Float32 every glow. */
+let _blurTmp = null;
+let _blurTmpLen = 0;
+
 export function boxBlurBuf(buf, radiusX, radiusY = radiusX) {
   const rx = Math.max(0, Math.round(radiusX));
   const ry = Math.max(0, Math.round(radiusY));
   if (rx < 1 && ry < 1) return buf;
   const { w, h, data } = buf;
-  const tmp = new Float32Array(w * h * 4);
+  const n = w * h * 4;
+  if (!_blurTmp || _blurTmpLen < n) {
+    _blurTmp = new Float32Array(n);
+    _blurTmpLen = n;
+  }
+  const tmp = _blurTmp;
 
   for (let pass = 0; pass < 2; pass++) {
     if (rx >= 1) {
       const inv = 1 / (2 * rx + 1);
       for (let y = 0; y < h; y++) {
         const row = y * w;
-        const sum = [0, 0, 0, 0];
+        let sum0 = 0;
+        let sum1 = 0;
+        let sum2 = 0;
+        let sum3 = 0;
         for (let x = -rx; x <= rx; x++) {
-          const i = (row + Math.min(w - 1, Math.max(0, x))) * 4;
-          for (let c = 0; c < 4; c++) sum[c] += data[i + c];
+          const i = (row + (x < 0 ? 0 : x >= w ? w - 1 : x)) << 2;
+          sum0 += data[i];
+          sum1 += data[i + 1];
+          sum2 += data[i + 2];
+          sum3 += data[i + 3];
         }
         for (let x = 0; x < w; x++) {
-          const o = (row + x) * 4;
-          for (let c = 0; c < 4; c++) tmp[o + c] = sum[c] * inv;
-          const out = (row + Math.min(w - 1, Math.max(0, x - rx))) * 4;
-          const add = (row + Math.min(w - 1, Math.max(0, x + rx + 1))) * 4;
-          for (let c = 0; c < 4; c++) sum[c] += data[add + c] - data[out + c];
+          const o = (row + x) << 2;
+          tmp[o] = sum0 * inv;
+          tmp[o + 1] = sum1 * inv;
+          tmp[o + 2] = sum2 * inv;
+          tmp[o + 3] = sum3 * inv;
+          const outX = x - rx;
+          const addX = x + rx + 1;
+          const out = (row + (outX < 0 ? 0 : outX >= w ? w - 1 : outX)) << 2;
+          const add = (row + (addX < 0 ? 0 : addX >= w ? w - 1 : addX)) << 2;
+          sum0 += data[add] - data[out];
+          sum1 += data[add + 1] - data[out + 1];
+          sum2 += data[add + 2] - data[out + 2];
+          sum3 += data[add + 3] - data[out + 3];
         }
       }
-      for (let i = 0; i < data.length; i++) data[i] = tmp[i];
+      for (let i = 0; i < n; i++) data[i] = tmp[i];
     }
 
     if (ry >= 1) {
       const inv = 1 / (2 * ry + 1);
       for (let x = 0; x < w; x++) {
-        const sum = [0, 0, 0, 0];
+        let sum0 = 0;
+        let sum1 = 0;
+        let sum2 = 0;
+        let sum3 = 0;
         for (let y = -ry; y <= ry; y++) {
-          const i = (Math.min(h - 1, Math.max(0, y)) * w + x) * 4;
-          for (let c = 0; c < 4; c++) sum[c] += data[i + c];
+          const yy = y < 0 ? 0 : y >= h ? h - 1 : y;
+          const i = (yy * w + x) << 2;
+          sum0 += data[i];
+          sum1 += data[i + 1];
+          sum2 += data[i + 2];
+          sum3 += data[i + 3];
         }
         for (let y = 0; y < h; y++) {
-          const o = (y * w + x) * 4;
-          for (let c = 0; c < 4; c++) tmp[o + c] = sum[c] * inv;
-          const out = (Math.min(h - 1, Math.max(0, y - ry)) * w + x) * 4;
-          const add = (Math.min(h - 1, Math.max(0, y + ry + 1)) * w + x) * 4;
-          for (let c = 0; c < 4; c++) sum[c] += data[add + c] - data[out + c];
+          const o = (y * w + x) << 2;
+          tmp[o] = sum0 * inv;
+          tmp[o + 1] = sum1 * inv;
+          tmp[o + 2] = sum2 * inv;
+          tmp[o + 3] = sum3 * inv;
+          const outY = y - ry;
+          const addY = y + ry + 1;
+          const oy = outY < 0 ? 0 : outY >= h ? h - 1 : outY;
+          const ay = addY < 0 ? 0 : addY >= h ? h - 1 : addY;
+          const out = (oy * w + x) << 2;
+          const add = (ay * w + x) << 2;
+          sum0 += data[add] - data[out];
+          sum1 += data[add + 1] - data[out + 1];
+          sum2 += data[add + 2] - data[out + 2];
+          sum3 += data[add + 3] - data[out + 3];
         }
       }
-      for (let i = 0; i < data.length; i++) data[i] = tmp[i];
+      for (let i = 0; i < n; i++) data[i] = tmp[i];
     }
   }
   return buf;

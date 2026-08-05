@@ -7,12 +7,13 @@
  */
 
 import { bufFromDrawable, bufToCanvas } from "./buffer.js";
-import { planPreview, ARTWORK_UNITS } from "./context.js";
+import { planPreview, ARTWORK_UNITS, PREVIEW_EDGE } from "./context.js";
 import { exportImage, downloadBlob, describeExport } from "./export.js";
 import {
   getRenderClient,
   workerSupported,
   installRenderWorker,
+  paintLayerPatch,
 } from "./render/client.js";
 import { createLayerStack } from "./ui/layers.js";
 import { pickFile } from "./ui/controls.js";
@@ -46,6 +47,8 @@ const state = {
   cacheKey: "",
   /** True when the worker already holds the buffer for `cacheKey`. */
   workerHasSource: false,
+  /** True when the worker holds a sticky layer DTO for paint patches. */
+  workerHasLayers: false,
   rendering: false,
   /** Where the preview was letterboxed on the canvas — the brush needs it. */
   viewport: null,
@@ -67,9 +70,15 @@ stageCanvas.style.display = "block";
 holder.appendChild(stageCanvas);
 const stageCtx = stageCanvas.getContext("2d");
 
-/** Logical buffer size in CSS-pixel units (no devicePixelRatio scaling). */
+/**
+ * Stage size in CSS pixels (layout). Drawing uses a devicePixelRatio-backed
+ * buffer so the stage stays sharp on retina; coordinates stay in CSS space via
+ * setTransform(dpr, …).
+ */
 let stageW = 1;
 let stageH = 1;
+/** Active backing scale (usually window.devicePixelRatio). */
+let stageDpr = 1;
 
 let quickMask = null;
 let quickMaskImg = null;
@@ -84,22 +93,35 @@ function stageSize() {
   return { w, h };
 }
 
+/** Cap DPR so a huge desktop canvas does not balloon memory (3× is plenty). */
+function stageDevicePixelRatio() {
+  const raw = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+  return Math.max(1, Math.min(3, raw));
+}
+
 /** Keep the drawing buffer matched to the stage so letterboxing stays accurate. */
 function fitStage() {
   const { w, h } = stageSize();
-  if (stageW !== w || stageH !== h) {
+  const dpr = stageDevicePixelRatio();
+  if (stageW !== w || stageH !== h || stageDpr !== dpr) {
     stageW = w;
     stageH = h;
-    stageCanvas.width = w;
-    stageCanvas.height = h;
+    stageDpr = dpr;
+    // Backing store in device pixels; CSS size stays 100% via style.
+    stageCanvas.width = Math.max(1, Math.round(w * dpr));
+    stageCanvas.height = Math.max(1, Math.round(h * dpr));
   }
-  // CSS size stays 100% so layout reflows and getBoundingClientRect stay aligned
-  // with the drawing buffer (width/height attributes = CSS pixel units).
   paintStage();
+}
+
+/** Map drawing into CSS-pixel space on the DPR-scaled buffer. */
+function stageCssTransform() {
+  stageCtx.setTransform(stageDpr, 0, 0, stageDpr, 0, 0);
 }
 
 /** Blit the preview (and optional mask overlay) into the stage with letterboxing. */
 function paintStage() {
+  stageCssTransform();
   stageCtx.clearRect(0, 0, stageW, stageH);
   const src = state.previewCanvas;
   if (!src) {
@@ -107,7 +129,7 @@ function paintStage() {
     return;
   }
 
-  // Letterbox the preview into the stage with a small margin.
+  // Letterbox the preview into the stage with a small margin (CSS pixels).
   const k = Math.min(stageW / src.width, stageH / src.height) * 0.96;
   const w = src.width * k;
   const h = src.height * k;
@@ -164,8 +186,9 @@ function paintStage() {
       stageCtx.drawImage(quickMask, x, y, w, h);
     }
     stageCtx.strokeStyle = "rgba(255,255,255,0.85)";
+    // 1 CSS px stroke (becomes ~dpr device pixels) — visible hairline on retina.
     stageCtx.lineWidth = 1;
-    stageCtx.strokeRect(x, y, w, h);
+    stageCtx.strokeRect(x + 0.5, y + 0.5, Math.max(0, w - 1), Math.max(0, h - 1));
   }
 }
 
@@ -178,6 +201,34 @@ document.addEventListener("glitchinarium:mask-preview", () => paintStage());
 const stageResize = new ResizeObserver(() => fitStage());
 stageResize.observe(stage);
 stageResize.observe(holder);
+
+// Cross-monitor / zoom: DPR can change without a layout-only ResizeObserver fire.
+if (typeof window !== "undefined") {
+  window.addEventListener("resize", () => fitStage());
+  if (typeof window.matchMedia === "function") {
+    let dprMq = null;
+    const watchDpr = () => {
+      try {
+        dprMq?.removeEventListener?.("change", onDprMq);
+      } catch {
+        /* ignore */
+      }
+      try {
+        dprMq = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+        dprMq.addEventListener?.("change", onDprMq);
+      } catch {
+        dprMq = null;
+      }
+    };
+    const onDprMq = () => {
+      fitStage();
+      watchDpr();
+      // Preview pixel budget tracks DPR — re-render so the image is not soft.
+      if (state.image) scheduleRender();
+    };
+    watchDpr();
+  }
+}
 
 // ----------------------------------------------------------------- render
 
@@ -192,6 +243,16 @@ let previewChain = Promise.resolve();
 const PAINT_PREVIEW_EDGE = 540;
 /** Trailing debounce for slider/stack edits (ms). */
 const PREVIEW_DEBOUNCE_MS = 40;
+
+/**
+ * Preview long-edge budget. Scale with DPR so retina stages are not just a
+ * soft upscale of a 1× buffer (paint stays cheaper than full preview).
+ */
+function previewMaxEdge(painting) {
+  const dpr = stageDevicePixelRatio();
+  if (painting) return Math.round(PAINT_PREVIEW_EDGE * Math.min(dpr, 1.5));
+  return Math.round(PREVIEW_EDGE * Math.min(dpr, 2));
+}
 
 const renderClient = getRenderClient();
 
@@ -246,7 +307,55 @@ function scheduleRender() {
 /** Drop layer cache (worker + local fallback). Optionally drop sticky source. */
 function invalidateCache({ clearSource = false } = {}) {
   state.workerHasSource = clearSource ? false : state.workerHasSource;
-  renderClient.invalidateCache({ clearSource });
+  // Stack / params may change — sticky DTO is no longer trustworthy.
+  state.workerHasLayers = false;
+  renderClient.invalidateCache({ clearSource, clearLayers: true });
+}
+
+/** Merge worker mask payload into sticky lastMasks (supports deltas). */
+function mergeMasks(result) {
+  if (!result) return;
+  if (!result.maskDeltas) {
+    if (result.masks?.size) state.lastMasks = result.masks;
+    return;
+  }
+  if (!state.lastMasks) state.lastMasks = new Map();
+  for (const [id, m] of result.masks ?? []) {
+    state.lastMasks.set(id, m);
+  }
+  for (const id of result.removedMaskIds ?? []) {
+    state.lastMasks.delete(id);
+  }
+  // unchangedMaskIds: keep existing entries as-is
+}
+
+/** Apply a preview result buffer or ImageBitmap onto state.previewCanvas. */
+function applyPreviewPixels(result) {
+  if (result.paintOnly) return;
+  if (result.bitmap) {
+    const bmp = result.bitmap;
+    const w = bmp.width;
+    const h = bmp.height;
+    if (!state.previewCanvas || state.previewCanvas.width !== w || state.previewCanvas.height !== h) {
+      state.previewCanvas = document.createElement("canvas");
+      state.previewCanvas.width = w;
+      state.previewCanvas.height = h;
+    }
+    const g = state.previewCanvas.getContext("2d");
+    g.clearRect(0, 0, w, h);
+    g.drawImage(bmp, 0, 0);
+    if (typeof bmp.close === "function") {
+      try {
+        bmp.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    return;
+  }
+  if (result.buf) {
+    state.previewCanvas = bufToCanvas(result.buf, state.previewCanvas ?? undefined);
+  }
 }
 
 /**
@@ -277,11 +386,7 @@ async function renderPreview(seq) {
     ? state.layers.findIndex((l) => l.id === paintLayer.id)
     : -1;
 
-  const plan = planPreview(
-    state.image.w,
-    state.image.h,
-    painting ? PAINT_PREVIEW_EDGE : undefined
-  );
+  const plan = planPreview(state.image.w, state.image.h, previewMaxEdge(painting));
   // Source pixels depend only on image + size. Seed is not in the sticky key —
   // it only invalidates the layer cache (processors re-roll).
   const sourceKey = `${plan.renderW}x${plan.renderH}`;
@@ -317,14 +422,25 @@ async function renderPreview(seq) {
     return;
   }
 
+  // Paint-fast + sticky worker layers: send only stroke patch (not full DTO).
+  const usePaintPatch =
+    paintFast &&
+    renderClient.supported &&
+    state.workerHasLayers &&
+    !!paintLayer;
+
   const result = await renderClient.renderJob(
     {
       mode: "preview",
       sourceBuf: state.previewSource,
       sourceKey,
       sendSource,
-      // Paint-fast only needs the prefix through the paint mask.
-      layers: paintFast ? state.layers.slice(0, paintIndex + 1) : state.layers,
+      layers: usePaintPatch
+        ? undefined
+        : paintFast
+          ? state.layers.slice(0, paintIndex + 1)
+          : state.layers,
+      layerPatch: usePaintPatch ? paintLayerPatch(paintLayer) : null,
       seed: state.seed,
       ssaa: 1,
       renderW: plan.renderW,
@@ -335,6 +451,9 @@ async function renderPreview(seq) {
       useCache: !paintFast,
       returnMasks: true,
       paintOnly: paintFast,
+      maskDeltas: true,
+      maskIds: paintFast && paintLayer ? [paintLayer.id] : null,
+      preferBitmap: true,
       yieldMs: paintFast ? 32 : 8,
     },
     {
@@ -348,13 +467,12 @@ async function renderPreview(seq) {
   }
 
   if (sendSource) state.workerHasSource = true;
+  // Full DTO landed on the worker (or local). Patches keep sticky.
+  if (!usePaintPatch) state.workerHasLayers = renderClient.supported;
 
   const ms = performance.now() - t0;
-  state.lastMasks = result.masks?.size ? result.masks : state.lastMasks;
-
-  if (!paintFast && result.buf) {
-    state.previewCanvas = bufToCanvas(result.buf, state.previewCanvas ?? undefined);
-  }
+  mergeMasks(result);
+  applyPreviewPixels(result);
   paintStage();
 
   const active = state.layers.filter((l) => l.enabled).length;
@@ -507,6 +625,7 @@ async function loadImageFile(file) {
     $("stage").classList.add("has-image");
     $("export-btn").disabled = false;
     state.cacheKey = "";
+    state.workerHasLayers = false;
     invalidateCache({ clearSource: true });
     // Supersede any in-flight preview that was still using the old source.
     previewSeq++;
@@ -581,7 +700,8 @@ function stageToImage(clientX, clientY) {
   const vp = state.viewport;
   if (!vp) return null;
   const rect = stageCanvas.getBoundingClientRect();
-  // Layout is CSS pixels; buffer width/height match those units (no DPR scaling).
+  // Pointer is in CSS pixels; viewport is stored in the same CSS space (DPR is
+  // only applied via setTransform when painting).
   const sx = ((clientX - rect.left) / rect.width) * stageW;
   const sy = ((clientY - rect.top) / rect.height) * stageH;
   const nx = (sx - vp.x) / vp.w;

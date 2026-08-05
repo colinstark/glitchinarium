@@ -1,13 +1,20 @@
 /**
  * Render worker — runs the layer pipeline off the main thread.
  *
- * Receives a transferable RGBA source + layer DTO, returns transferable pixels.
- * Preview layer cache and sticky source live here (not re-transferred each frame).
+ * Receives a transferable RGBA source + layer DTO, returns transferable pixels
+ * (or an ImageBitmap for preview). Preview layer cache and sticky source live
+ * here (not re-transferred each frame).
  */
 
 import { createContext } from "../context.js";
 import { renderAsync } from "../pipeline.js";
-import { boxDownsample, bufFromTransfer, bufToTransfer } from "../buffer.js";
+import {
+  boxDownsample,
+  bufFromTransfer,
+  bufToTransfer,
+  bufToImageData,
+  createSurface,
+} from "../buffer.js";
 import { MSG } from "./protocol.js";
 
 /** @type {Array<{key:string, buf:any, masks:Map}>} */
@@ -15,8 +22,15 @@ let previewCache = [];
 /** Sticky decoded source so preview frames only transfer when size/seed changes. */
 let stickySource = null;
 let stickySourceKey = null;
+/** Last full layer DTO for preview — paint jobs patch strokes onto this. */
+let stickyLayers = null;
+/** Last transferred mask stamp per id — skip unchanged masks. */
+let maskStamps = new Map();
 let activeJobId = 0;
 let abortRequested = false;
+
+/** Reused OffscreenCanvas for preview ImageBitmap encoding. */
+let bitmapCanvas = null;
 
 async function loadFonts(fonts = []) {
   if (!fonts.length || typeof FontFace === "undefined" || !self.fonts) return;
@@ -36,6 +50,102 @@ async function loadFonts(fonts = []) {
 function clearSticky() {
   stickySource = null;
   stickySourceKey = null;
+}
+
+function clearLayerSticky() {
+  stickyLayers = null;
+  maskStamps = new Map();
+}
+
+function maskStamp(m) {
+  if (m._rev != null) return `${m.w}x${m.h}|r${m._rev}`;
+  // Fallback when processor did not stamp a revision.
+  return `${m.w}x${m.h}|${m.data.length}|${m.bbox ? `${m.bbox.x0},${m.bbox.y0},${m.bbox.x1},${m.bbox.y1}` : "-"}`;
+}
+
+/**
+ * Pack masks for transfer. With maskDeltas, skip payloads whose stamp matches
+ * the last send. maskIds (if set) filters to those ids only.
+ */
+function packMasks(ctx, { returnMasks, maskDeltas, maskIds }) {
+  const masks = [];
+  const transferList = [];
+  const removedMaskIds = [];
+  if (!returnMasks || !ctx.masks?.size) {
+    if (maskDeltas && maskStamps.size) {
+      for (const id of maskStamps.keys()) removedMaskIds.push(id);
+      maskStamps = new Map();
+    }
+    return { masks, transferList, removedMaskIds };
+  }
+
+  const allow = maskIds?.length ? new Set(maskIds) : null;
+  const seen = new Set();
+
+  for (const [maskId, m] of ctx.masks) {
+    if (allow && !allow.has(maskId)) continue;
+    seen.add(maskId);
+    const stamp = maskStamp(m);
+    if (maskDeltas && maskStamps.get(maskId) === stamp) {
+      masks.push({ id: maskId, unchanged: true });
+      continue;
+    }
+    maskStamps.set(maskId, stamp);
+    const copy = m.data.buffer.slice(
+      m.data.byteOffset,
+      m.data.byteOffset + m.data.byteLength
+    );
+    masks.push({
+      id: maskId,
+      w: m.w,
+      h: m.h,
+      buffer: copy,
+      rev: m._rev ?? null,
+      bbox: m.bbox ?? null,
+    });
+    transferList.push(copy);
+  }
+
+  if (maskDeltas) {
+    for (const id of [...maskStamps.keys()]) {
+      if (!seen.has(id) && (!allow || allow.has(id))) {
+        // Only drop stamps for masks we would have considered this frame.
+        if (!allow || !ctx.masks.has(id)) {
+          maskStamps.delete(id);
+          removedMaskIds.push(id);
+        }
+      }
+    }
+    // Full mask map: remove stamps for masks no longer present.
+    if (!allow) {
+      for (const id of [...maskStamps.keys()]) {
+        if (!ctx.masks.has(id)) {
+          maskStamps.delete(id);
+          if (!removedMaskIds.includes(id)) removedMaskIds.push(id);
+        }
+      }
+    }
+  }
+
+  return { masks, transferList, removedMaskIds };
+}
+
+async function bufToBitmap(buf) {
+  if (typeof createImageBitmap !== "function") return null;
+  try {
+    if (!bitmapCanvas || bitmapCanvas.width !== buf.w || bitmapCanvas.height !== buf.h) {
+      bitmapCanvas = createSurface(buf.w, buf.h);
+    } else {
+      // ensure size
+      if (bitmapCanvas.width !== buf.w) bitmapCanvas.width = buf.w;
+      if (bitmapCanvas.height !== buf.h) bitmapCanvas.height = buf.h;
+    }
+    const g = bitmapCanvas.getContext("2d");
+    g.putImageData(bufToImageData(buf), 0, 0);
+    return await createImageBitmap(bitmapCanvas);
+  } catch {
+    return null;
+  }
 }
 
 self.onmessage = async (ev) => {
@@ -60,6 +170,9 @@ self.onmessage = async (ev) => {
         // Keep sticky source — size/seed key still matches; only layer cache dies.
         // Full source reset is driven by a new sourceKey + source payload.
         if (msg.clearSource) clearSticky();
+        if (msg.clearLayers) clearLayerSticky();
+        // Mask stamps are invalid when layer cache dies (masks may recompute).
+        maskStamps = new Map();
         break;
       }
 
@@ -74,9 +187,30 @@ self.onmessage = async (ev) => {
         activeJobId = id;
         abortRequested = false;
 
-        if (job.invalidateCache) previewCache = [];
+        if (job.invalidateCache) {
+          previewCache = [];
+          maskStamps = new Map();
+        }
 
-        const layers = job.layers;
+        // Layers: full DTO replaces sticky; paint patch merges strokes.
+        let layers;
+        if (job.layers) {
+          stickyLayers = job.layers;
+          layers = stickyLayers;
+        } else if (job.layerPatch && stickyLayers) {
+          const patch = job.layerPatch;
+          const target = stickyLayers.find((l) => l.id === patch.id);
+          if (target && patch.params) {
+            Object.assign(target.params, patch.params);
+            target._keyDirty = true;
+          }
+          layers = stickyLayers;
+        } else if (stickyLayers) {
+          layers = stickyLayers;
+        } else {
+          throw new Error("render worker: layer stack missing");
+        }
+
         const mode = job.mode === "export" ? "export" : "preview";
 
         // Source: export always carries its own buffer (do not clobber preview sticky).
@@ -156,52 +290,58 @@ self.onmessage = async (ev) => {
           });
         }
 
-        // Masks for stage overlay (preview / paint). Transfer Float32 buffers.
-        const masks = [];
-        const transferList = [];
-        if (job.returnMasks && ctx.masks?.size) {
-          for (const [maskId, m] of ctx.masks) {
-            const copy = m.data.buffer.slice(
-              m.data.byteOffset,
-              m.data.byteOffset + m.data.byteLength
-            );
-            masks.push({
-              id: maskId,
-              w: m.w,
-              h: m.h,
-              buffer: copy,
-              rev: m._rev ?? null,
-              bbox: m.bbox ?? null,
-            });
-            transferList.push(copy);
-          }
-        }
+        const { masks, transferList, removedMaskIds } = packMasks(ctx, {
+          returnMasks: job.returnMasks,
+          maskDeltas: !!job.maskDeltas,
+          maskIds: job.maskIds ?? null,
+        });
 
-        // Paint-fast: main keeps the previous full-stack canvas; still send
-        // image so callers can ignore it, but prefer not to transfer a huge
-        // unused buffer when paintOnly is set.
+        // Paint-fast: main keeps the previous full-stack canvas; only masks.
         if (job.paintOnly) {
-          self.postMessage({
-            type: MSG.RESULT,
-            id,
-            image: null,
-            masks,
-            renderW: job.renderW,
-            renderH: job.renderH,
-            paintOnly: true,
-          }, transferList);
+          self.postMessage(
+            {
+              type: MSG.RESULT,
+              id,
+              image: null,
+              bitmap: null,
+              masks,
+              removedMaskIds,
+              renderW: job.renderW,
+              renderH: job.renderH,
+              paintOnly: true,
+            },
+            transferList
+          );
           break;
         }
 
-        const image = bufToTransfer(final);
-        transferList.push(image.buffer);
+        // Preview prefers ImageBitmap (GPU-friendly draw on main). Export needs Buf for encode.
+        let bitmap = null;
+        let image = null;
+        if (mode === "preview" && job.preferBitmap !== false) {
+          bitmap = await bufToBitmap(final);
+        }
+        if (!bitmap) {
+          image = bufToTransfer(final);
+          transferList.push(image.buffer);
+        } else {
+          transferList.push(bitmap);
+        }
+
+        if (abortRequested || id !== activeJobId) {
+          if (bitmap?.close) try { bitmap.close(); } catch { /* ignore */ }
+          self.postMessage({ type: MSG.ABORTED, id });
+          break;
+        }
 
         self.postMessage(
           {
             type: MSG.RESULT,
             id,
             image,
+            bitmap,
             masks,
+            removedMaskIds,
             renderW: job.renderW,
             renderH: job.renderH,
           },

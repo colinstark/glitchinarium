@@ -46,6 +46,20 @@ export function layersToDTO(layers, endIndex = layers.length) {
   return out;
 }
 
+/**
+ * Paint-fast patch: only the strokes (and optional param fields) for one mask
+ * layer. Worker merges onto its sticky layer DTO.
+ */
+export function paintLayerPatch(layer) {
+  if (!layer) return null;
+  return {
+    id: layer.id,
+    params: {
+      strokes: structuredClone(layer.params?.strokes ?? []),
+    },
+  };
+}
+
 /** True when this environment can run the off-main render worker. */
 export function workerSupported() {
   return (
