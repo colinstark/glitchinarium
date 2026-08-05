@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Glitchinarium · layered image processor</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=IBM+Plex+Mono:wght@400;500&family=JetBrains+Mono:wght@400;500;700&family=Press+Start+2P&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="panel">
+        <header class="panel-head">
+          <div class="panel-brand">
+            <h1>Glitchinarium</h1>
+            <p class="subtitle">Layered image processor</p>
+          </div>
+          <div class="head-preset">
+            <label class="sr-only" for="preset">Preset</label>
+            <select class="ctl-select head-preset-select" id="preset" title="Load preset"></select>
+            <div class="head-preset-actions">
+              <button type="button" class="btn btn-ghost btn-sm" id="preset-save" title="Save current stack as preset">
+                Save
+              </button>
+              <button type="button" class="btn btn-ghost btn-sm" id="preset-export" title="Export preset JSON">
+                Export
+              </button>
+              <button type="button" class="btn btn-ghost btn-sm" id="preset-import" title="Import preset JSON">
+                Import
+              </button>
+            </div>
+          </div>
+        </header>
+
+        <div class="panel-body">
+        <section class="block">
+          <div class="block-title">Source</div>
+          <div
+            class="dropzone"
+            id="dropzone"
+            role="button"
+            tabindex="0"
+            aria-label="Drop an image, or click to choose"
+          >
+            <canvas
+              class="dropzone-thumb"
+              id="source-thumb"
+              width="48"
+              height="48"
+              hidden
+              aria-hidden="true"
+            ></canvas>
+            <div class="dropzone-copy">
+              <span id="dropzone-label">Drop an image, or click to choose</span>
+              <span class="dropzone-meta" id="source-meta"></span>
+            </div>
+          </div>
+          <input type="file" id="source-input" accept="image/*" hidden />
+        </section>
+
+        <section class="block" aria-label="Global">
+          <div class="param">
+            <label class="param-label">
+              <span class="param-name">Seed</span>
+              <span class="param-value" id="seed-value">1</span>
+            </label>
+            <div class="ctl-row">
+              <input class="ctl-range" id="seed" type="range" min="1" max="9999" step="1" value="1" />
+              <button type="button" class="btn btn-ghost btn-sm btn-icon" id="seed-random" title="Random seed" aria-label="Random seed">
+                ⟳
+              </button>
+            </div>
+          </div>
+          <div class="global-actions">
+            <div class="seg" role="group" aria-label="Stack actions">
+              <button type="button" class="seg-btn" id="stack-clear" title="Clear stack">Clear</button>
+              <button type="button" class="seg-btn" id="shuffle-stack" title="New randomized stack">New</button>
+              <button type="button" class="seg-btn" id="shuffle-params" title="Shuffle unlocked params">Shuffle</button>
+            </div>
+            <details class="rand-details">
+              <summary class="rand-details-summary">Randomize</summary>
+              <div class="rand-details-body">
+                <div class="param">
+                  <label class="param-label">
+                    <span class="param-name">Intensity</span>
+                    <span class="param-value" id="rand-intensity-value">70%</span>
+                  </label>
+                  <input
+                    class="ctl-range"
+                    id="rand-intensity"
+                    type="range"
+                    min="0.05"
+                    max="1"
+                    step="0.05"
+                    value="0.7"
+                    title="How far Shuffle / per-layer ⟳ walks from current values"
+                  />
+                </div>
+                <div class="scopes" id="scopes"></div>
+                <p class="param-hint">🔒 locks survive Shuffle</p>
+              </div>
+            </details>
+          </div>
+        </section>
+
+        <section class="block block-grow">
+          <div class="block-title">
+            Layers
+            <span class="block-note">top runs first · masks above effects</span>
+          </div>
+          <div id="layer-stack" class="layer-stack"></div>
+          <button type="button" class="btn btn-add" id="add-layer">+ Add layer</button>
+        </section>
+        </div>
+
+        <section class="block block-export" aria-label="Export">
+          <div class="export-opts">
+            <div class="seg" id="export-scale" role="radiogroup" aria-label="Export scale">
+              <button type="button" class="seg-btn" data-scale="1" role="radio" aria-checked="false">1×</button>
+              <button type="button" class="seg-btn is-active" data-scale="2" role="radio" aria-checked="true">2×</button>
+              <button type="button" class="seg-btn" data-scale="4" role="radio" aria-checked="false">4×</button>
+            </div>
+            <div class="seg" id="export-format" role="radiogroup" aria-label="Export format">
+              <button type="button" class="seg-btn is-active" data-format="png" role="radio" aria-checked="true">PNG</button>
+              <button type="button" class="seg-btn" data-format="jpg" role="radio" aria-checked="false">JPG</button>
+            </div>
+          </div>
+          <button type="button" class="btn btn-primary" id="export-btn" disabled>Export PNG</button>
+        </section>
+      </aside>
+
+      <main class="stage" id="stage">
+        <div id="canvas-holder" class="canvas-holder"></div>
+        <div class="stage-empty" id="stage-empty" aria-hidden="true">
+          <p class="stage-empty-title">Drop an image to begin</p>
+          <p class="stage-empty-hint">PNG · JPEG · WebP · or pick in Source</p>
+        </div>
+        <div class="status" id="status" role="status" aria-live="polite">Ready · drop an image</div>
+        <div class="overlay" id="overlay" hidden>
+          <div class="overlay-card">
+            <div class="overlay-title" id="overlay-title">Rendering…</div>
+            <div class="overlay-bar"><div class="overlay-fill" id="overlay-fill"></div></div>
+            <div class="overlay-note" id="overlay-note"></div>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

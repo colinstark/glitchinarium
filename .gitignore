@@ -1,0 +1,10 @@
+node_modules/
+out/
+
+.DS_Store
+
+# Impeccable (design skill context + runtime)
+.impeccable/
+.impeccable.md
+PRODUCT.md
+DESIGN.md

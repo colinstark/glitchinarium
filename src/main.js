@@ -1,0 +1,798 @@
+/**
+ * App bootstrap.
+ *
+ * p5 runs in instance mode and owns exactly one job: the canvas that displays
+ * the preview. Every pixel of actual image processing happens in the pipeline
+ * on plain typed arrays — p5's per-pixel API is orders of magnitude too slow
+ * for a 4x export, and going through it would defeat the whole design.
+ */
+
+import p5 from "p5";
+
+import { bufFromDrawable, bufToCanvas } from "./buffer.js";
+import { createContext, planPreview, ARTWORK_UNITS } from "./context.js";
+import { renderAsync } from "./pipeline.js";
+import { exportImage, downloadBlob, describeExport } from "./export.js";
+import { createLayerStack } from "./ui/layers.js";
+import { pickFile } from "./ui/controls.js";
+import { brushState, attachBrush, onBrushChange, endPaint } from "./ui/brush.js";
+import { randomizeParams, randomizeStack, SCOPES } from "./ui/randomize.js";
+import {
+  BUILTIN,
+  instantiate,
+  serialise,
+  loadUserPresets,
+  saveUserPreset,
+} from "./ui/presets.js";
+
+const $ = (id) => document.getElementById(id);
+
+const state = {
+  layers: [],
+  seed: 1,
+  scale: 2,
+  format: "png", // "png" | "jpg"
+  image: null, // { drawable, w, h, name }
+  previewSource: null,
+  previewCanvas: null,
+  cache: [],
+  cacheKey: "",
+  rendering: false,
+  /** Where the preview was letterboxed on the canvas — the brush needs it. */
+  viewport: null,
+  /** Masks from the last render, so the brush can show a quick-mask overlay. */
+  lastMasks: null,
+  /** Layer id whose mask is overlaid on the stage (View mask / paint mode). */
+  previewMaskId: null,
+};
+
+// --------------------------------------------------------------------- p5
+
+const holder = $("canvas-holder");
+const stage = $("stage");
+let sketch = null;
+
+/** Stage size in CSS pixels — never trust a 0×0 first paint. */
+function stageSize() {
+  const w = Math.max(1, Math.floor(holder.clientWidth || stage.clientWidth || 1));
+  const h = Math.max(1, Math.floor(holder.clientHeight || stage.clientHeight || 1));
+  return { w, h };
+}
+
+/** Keep the p5 buffer matched to the stage so letterboxing stays accurate. */
+function fitStage() {
+  if (!sketch) return;
+  const { w, h } = stageSize();
+  if (sketch.width !== w || sketch.height !== h) {
+    sketch.resizeCanvas(w, h);
+  }
+  // p5 sets fixed px styles; force the element to fill the holder so CSS resize
+  // and the drawing buffer stay in lockstep via getBoundingClientRect mapping.
+  const canvas = sketch.canvas;
+  if (canvas) {
+    canvas.style.width = "100%";
+    canvas.style.height = "100%";
+  }
+  sketch.redraw();
+}
+
+new p5((p) => {
+  sketch = p;
+
+  p.setup = () => {
+    const { w, h } = stageSize();
+    const c = p.createCanvas(w, h);
+    c.parent(holder);
+    p.noLoop();
+    // Match holder after layout settles (first paint can be 0×0 without absolute fill).
+    queueMicrotask(fitStage);
+  };
+
+  p.draw = () => {
+    p.clear();
+    const src = state.previewCanvas;
+    if (!src) {
+      state.viewport = null;
+      return;
+    }
+
+    // Letterbox the preview into the stage with a small margin.
+    const k = Math.min(p.width / src.width, p.height / src.height) * 0.96;
+    const w = src.width * k;
+    const h = src.height * k;
+    const x = (p.width - w) / 2;
+    const y = (p.height - h) / 2;
+    state.viewport = { x, y, w, h };
+
+    const g = p.drawingContext;
+    g.imageSmoothingEnabled = true;
+    g.imageSmoothingQuality = "high";
+    g.drawImage(src, x, y, w, h);
+
+    // Mask overlay while viewing or painting — pink where the mask is white.
+    // Rebuild only when the mask buffer identity changes (cache hits reuse data).
+    const overlayId = brushState.layer?.id ?? state.previewMaskId;
+    if (overlayId) {
+      const mask = state.lastMasks?.get(overlayId);
+      if (mask) {
+        if (
+          !quickMask ||
+          quickMask.width !== mask.w ||
+          quickMask.height !== mask.h ||
+          maskOverlayData !== mask.data
+        ) {
+          if (!quickMask || quickMask.width !== mask.w || quickMask.height !== mask.h) {
+            quickMask = document.createElement("canvas");
+            quickMask.width = mask.w;
+            quickMask.height = mask.h;
+          }
+          maskOverlayData = mask.data;
+          const qc = quickMask.getContext("2d");
+          const img = qc.createImageData(mask.w, mask.h);
+          for (let i = 0; i < mask.data.length; i++) {
+            const v = mask.data[i];
+            img.data[i * 4] = 255;
+            img.data[i * 4 + 1] = 40;
+            img.data[i * 4 + 2] = 70;
+            img.data[i * 4 + 3] = v * 160;
+          }
+          qc.putImageData(img, 0, 0);
+        }
+        g.drawImage(quickMask, x, y, w, h);
+      }
+      g.strokeStyle = "rgba(255,255,255,0.85)";
+      g.lineWidth = 1;
+      g.strokeRect(x, y, w, h);
+    }
+  };
+}, holder);
+
+document.addEventListener("glitchinarium:mask-preview", () => sketch?.redraw());
+
+let quickMask = null;
+/** Last mask.data reference baked into quickMask — identity check avoids rebuilds. */
+let maskOverlayData = null;
+
+// Observe the stage (not only the holder) so flex/grid reflows always refit.
+const stageResize = new ResizeObserver(() => fitStage());
+stageResize.observe(stage);
+stageResize.observe(holder);
+
+// ----------------------------------------------------------------- render
+
+let pending = null;
+/** True when a render was requested while export held the pipeline. */
+let renderAfterExport = false;
+/** Monotonic id so a superseded async preview can bail out. */
+let previewSeq = 0;
+/** Serialise preview runs so two async pipelines never share state.cache. */
+let previewChain = Promise.resolve();
+const PAINT_PREVIEW_EDGE = 540;
+
+function scheduleRender() {
+  updateExportMeta();
+  // Sliders benefit from trailing debounce; a brush needs steady feedback
+  // while pointer events keep arriving, so retain the already scheduled frame.
+  if (pending) {
+    if (brushState.active) return;
+    clearTimeout(pending);
+  }
+  pending = setTimeout(() => {
+    pending = null;
+    // Bump here so an in-flight preview aborts at the next layer boundary and
+    // cannot paint a stale result after a newer request was scheduled.
+    const seq = ++previewSeq;
+    previewChain = previewChain.then(() => renderPreview(seq)).catch((err) => {
+      console.error(err);
+      setStatus(`Preview failed: ${err.message || err}`);
+    });
+  }, 40);
+}
+
+function invalidateCache() {
+  state.cache.length = 0;
+}
+
+/**
+ * Replace the whole stack. Ends paint mode and clears mask preview so we never
+ * keep a brush attached to a layer that is no longer in the list.
+ */
+function replaceStack(next) {
+  if (brushState.layer) endPaint();
+  state.previewMaskId = null;
+  state.layers = next;
+}
+
+async function renderPreview(seq) {
+  if (!state.image) return;
+  // Export owns the pipeline; don't drop the request — run once it finishes.
+  if (state.rendering) {
+    renderAfterExport = true;
+    return;
+  }
+  // Superseded while waiting on the serialisation chain.
+  if (seq !== previewSeq) return;
+
+  const plan = planPreview(
+    state.image.w,
+    state.image.h,
+    brushState.active ? PAINT_PREVIEW_EDGE : undefined
+  );
+  const key = `${plan.renderW}x${plan.renderH}|${state.seed}`;
+  if (key !== state.cacheKey) {
+    // Seed and preview size both change what every layer produces, so neither
+    // is part of the per-layer cache key — they invalidate the whole thing.
+    state.previewSource = bufFromDrawable(state.image.drawable, plan.renderW, plan.renderH);
+    state.cacheKey = key;
+    invalidateCache();
+  }
+
+  const ctx = createContext({
+    renderW: plan.renderW,
+    renderH: plan.renderH,
+    ssaa: 1,
+    seed: state.seed,
+    mode: "preview",
+  });
+
+  const t0 = performance.now();
+  // Yield between layers so the tab stays responsive on heavy stacks.
+  const buf = await renderAsync(
+    state.layers,
+    state.previewSource,
+    ctx,
+    state.cache,
+    null,
+    () => seq !== previewSeq || state.rendering
+  );
+  if (!buf || seq !== previewSeq || state.rendering) {
+    if (state.rendering) renderAfterExport = true;
+    return;
+  }
+  const ms = performance.now() - t0;
+  state.lastMasks = ctx.masks;
+
+  state.previewCanvas = bufToCanvas(buf, state.previewCanvas ?? undefined);
+  sketch?.redraw();
+
+  const active = state.layers.filter((l) => l.enabled).length;
+  setStatus(
+    `${plan.renderW}×${plan.renderH} preview · ${active}/${state.layers.length} layers · ${ms.toFixed(0)} ms`
+  );
+}
+
+/** Live status line + optional export plan, painted as one stage pill. */
+let statusLine = "Ready · drop an image";
+let exportLine = "";
+let exportHeavy = false;
+
+function paintStatus() {
+  const el = $("status");
+  el.textContent = exportLine ? `${statusLine} · ${exportLine}` : statusLine;
+  el.classList.toggle("is-heavy", exportHeavy);
+}
+
+function setStatus(text) {
+  statusLine = text;
+  paintStatus();
+}
+
+// ------------------------------------------------------------ image input
+
+/** Some OS/browser drops leave `file.type` empty — accept by extension too. */
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|avif|svg)$/i;
+
+function isImageFile(file) {
+  if (!file) return false;
+  if (file.type) return file.type.startsWith("image/");
+  return IMAGE_EXT.test(file.name || "");
+}
+
+function hasFileDrag(e) {
+  const types = e.dataTransfer?.types;
+  if (!types) return false;
+  // DOMStringList or array — both support includes / contains.
+  if (typeof types.includes === "function") return types.includes("Files");
+  if (typeof types.contains === "function") return types.contains("Files");
+  return [...types].includes("Files");
+}
+
+async function decodeImageFile(file) {
+  // Prefer createImageBitmap: no object URL lifecycle, works for most formats.
+  try {
+    const bmp = await createImageBitmap(file);
+    return { drawable: bmp, w: bmp.width, h: bmp.height };
+  } catch {
+    // Fallback for environments/formats createImageBitmap rejects.
+    const url = URL.createObjectURL(file);
+    try {
+      const img = await new Promise((resolve, reject) => {
+        const im = new Image();
+        im.onload = () => resolve(im);
+        im.onerror = () => reject(new Error("browser could not decode this file"));
+        im.src = url;
+      });
+      return { drawable: img, w: img.naturalWidth || img.width, h: img.naturalHeight || img.height };
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+}
+
+/** Bumped on every load attempt so a slower earlier decode cannot win. */
+let loadGen = 0;
+
+/** Sidebar Source dropzone thumb — letterboxed into a fixed square. */
+function updateSourceThumb(drawable, w, h) {
+  const thumb = $("source-thumb");
+  if (!thumb || !drawable || !w || !h) {
+    if (thumb) {
+      thumb.hidden = true;
+      const g = thumb.getContext("2d");
+      if (g) g.clearRect(0, 0, thumb.width, thumb.height);
+    }
+    return;
+  }
+
+  const size = 48;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const px = Math.round(size * dpr);
+  thumb.width = px;
+  thumb.height = px;
+  thumb.hidden = false;
+
+  const g = thumb.getContext("2d");
+  if (!g) return;
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, px, px);
+  g.fillStyle = getComputedStyle(thumb).backgroundColor || "#000";
+  g.fillRect(0, 0, px, px);
+
+  const scale = Math.min(px / w, px / h);
+  const dw = Math.max(1, Math.round(w * scale));
+  const dh = Math.max(1, Math.round(h * scale));
+  const dx = Math.floor((px - dw) / 2);
+  const dy = Math.floor((px - dh) / 2);
+  g.imageSmoothingEnabled = true;
+  g.imageSmoothingQuality = "high";
+  g.drawImage(drawable, dx, dy, dw, dh);
+}
+
+async function loadImageFile(file) {
+  if (!file) return;
+  if (state.rendering) {
+    setStatus("Export in progress — wait before loading a new image");
+    return;
+  }
+  if (!isImageFile(file)) {
+    setStatus(`Not an image: ${file.name || "unknown file"}`);
+    return;
+  }
+
+  const gen = ++loadGen;
+  setStatus(`Loading ${file.name}…`);
+  try {
+    const decoded = await decodeImageFile(file);
+    // A newer pick/drop started while we were decoding — discard this result.
+    if (gen !== loadGen) {
+      if (decoded.drawable && typeof decoded.drawable.close === "function") {
+        try {
+          decoded.drawable.close();
+        } catch {
+          /* ignore */
+        }
+      }
+      return;
+    }
+
+    // Release a previous ImageBitmap so we don't leak GPU memory.
+    if (state.image?.drawable && typeof state.image.drawable.close === "function") {
+      try {
+        state.image.drawable.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    state.image = { ...decoded, name: file.name };
+
+    $("dropzone-label").textContent = state.image.name;
+    $("source-meta").textContent = `${state.image.w} × ${state.image.h}`;
+    $("dropzone").classList.add("has-file");
+    updateSourceThumb(state.image.drawable, state.image.w, state.image.h);
+    $("stage").classList.add("has-image");
+    $("export-btn").disabled = false;
+    state.cacheKey = "";
+    invalidateCache();
+    // Supersede any in-flight preview that was still using the old source.
+    previewSeq++;
+    updateExportMeta();
+    scheduleRender();
+  } catch (err) {
+    if (gen !== loadGen) return;
+    console.error(err);
+    setStatus(`Could not load image: ${err.message || err}`);
+  }
+}
+
+const dropzone = $("dropzone");
+const sourceInput = $("source-input");
+
+function openSourcePicker() {
+  sourceInput.value = "";
+  sourceInput.click();
+}
+
+dropzone.addEventListener("click", openSourcePicker);
+dropzone.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    openSourcePicker();
+  }
+});
+sourceInput.addEventListener("change", () => {
+  const file = sourceInput.files?.[0];
+  if (file) loadImageFile(file);
+});
+
+// Stop the browser from navigating away when a file is dropped anywhere.
+window.addEventListener("dragover", (e) => {
+  if (hasFileDrag(e)) e.preventDefault();
+});
+window.addEventListener("drop", (e) => {
+  if (hasFileDrag(e)) e.preventDefault();
+});
+
+for (const node of [dropzone, stage]) {
+  node.addEventListener("dragenter", (e) => {
+    if (!hasFileDrag(e)) return;
+    e.preventDefault();
+    dropzone.classList.add("is-over");
+  });
+  node.addEventListener("dragover", (e) => {
+    if (!hasFileDrag(e)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+    dropzone.classList.add("is-over");
+  });
+  node.addEventListener("dragleave", (e) => {
+    // Ignore leave events that are still inside this target (child spans).
+    if (e.relatedTarget && node.contains(e.relatedTarget)) return;
+    dropzone.classList.remove("is-over");
+  });
+  node.addEventListener("drop", (e) => {
+    if (!hasFileDrag(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dropzone.classList.remove("is-over");
+    const file = e.dataTransfer?.files?.[0];
+    if (file) loadImageFile(file);
+  });
+}
+
+// ------------------------------------------------------------------ brush
+
+/** Canvas client coords → normalised 0..1 image coords, or null if outside. */
+function stageToImage(clientX, clientY) {
+  const vp = state.viewport;
+  if (!vp || !sketch) return null;
+  const rect = sketch.canvas.getBoundingClientRect();
+  // The p5 canvas is laid out in CSS pixels but sized in sketch units.
+  const sx = ((clientX - rect.left) / rect.width) * sketch.width;
+  const sy = ((clientY - rect.top) / rect.height) * sketch.height;
+  const nx = (sx - vp.x) / vp.w;
+  const ny = (sy - vp.y) / vp.h;
+  if (nx < 0 || ny < 0 || nx > 1 || ny > 1) return null;
+  return { x: nx, y: ny };
+}
+
+attachBrush(stage, stageToImage);
+
+onBrushChange(() => {
+  stage.classList.toggle("is-painting", !!brushState.layer);
+  sketch?.redraw();
+});
+
+// ---------------------------------------------------------------- globals
+
+const seedInput = $("seed");
+seedInput.addEventListener("input", () => {
+  const n = Number(seedInput.value);
+  state.seed = Number.isFinite(n) ? n : 1;
+  $("seed-value").textContent = state.seed;
+  invalidateCache();
+  state.cacheKey = "";
+  scheduleRender();
+});
+
+$("seed-random").addEventListener("click", () => {
+  seedInput.value = String(1 + Math.floor(Math.random() * 9999));
+  seedInput.dispatchEvent(new Event("input"));
+});
+
+// ----------------------------------------------------------------- layers
+
+const stack = createLayerStack({
+  root: $("layer-stack"),
+  addButton: $("add-layer"),
+  getLayers: () => state.layers,
+  setLayers: (next) => {
+    state.layers = next;
+  },
+  onChange: scheduleRender,
+  getPreviewScale: () => {
+    if (!state.image) return 0;
+    const plan = planPreview(state.image.w, state.image.h);
+    return Math.max(plan.renderW, plan.renderH) / ARTWORK_UNITS;
+  },
+  getIntensity: () => randomizeIntensity,
+  getPreviewMaskId: () => state.previewMaskId,
+  setPreviewMaskId: (id) => {
+    state.previewMaskId = id;
+  },
+});
+
+$("stack-clear").addEventListener("click", () => {
+  replaceStack([]);
+  stack.render();
+  scheduleRender();
+});
+
+// -------------------------------------------------------------- randomize
+
+const scopeState = new Set(["tone", "halftone", "glyph", "warp", "glitch", "texture"]);
+const scopesRoot = $("scopes");
+let randomizeIntensity = 0.7;
+
+const intensityInput = $("rand-intensity");
+const intensityReadout = $("rand-intensity-value");
+const syncIntensity = () => {
+  randomizeIntensity = Number(intensityInput.value);
+  intensityReadout.textContent = `${Math.round(randomizeIntensity * 100)}%`;
+};
+intensityInput.addEventListener("input", syncIntensity);
+syncIntensity();
+
+for (const cat of SCOPES) {
+  const label = document.createElement("label");
+  label.className = "scope";
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.checked = scopeState.has(cat.id);
+  input.addEventListener("change", () => {
+    if (input.checked) scopeState.add(cat.id);
+    else scopeState.delete(cat.id);
+  });
+  label.append(input, document.createTextNode(cat.label));
+  scopesRoot.append(label);
+}
+
+$("shuffle-params").addEventListener("click", () => {
+  randomizeParams(state.layers, scopeState, randomizeIntensity);
+  state.cacheKey = "";
+  invalidateCache();
+  stack.render();
+  scheduleRender();
+});
+
+$("shuffle-stack").addEventListener("click", () => {
+  replaceStack(randomizeStack(scopeState, randomizeIntensity));
+  state.seed = 1 + Math.floor(Math.random() * 9999);
+  seedInput.value = String(state.seed);
+  $("seed-value").textContent = state.seed;
+  state.cacheKey = "";
+  invalidateCache();
+  stack.render();
+  scheduleRender();
+});
+
+// ---------------------------------------------------------------- presets
+
+const presetSelect = $("preset");
+
+function populatePresets() {
+  const user = loadUserPresets();
+  presetSelect.replaceChildren();
+
+  const blank = document.createElement("option");
+  blank.value = "";
+  blank.textContent = "—";
+  presetSelect.append(blank);
+
+  const group = (label, entries) => {
+    if (!Object.keys(entries).length) return;
+    const g = document.createElement("optgroup");
+    g.label = label;
+    for (const [key, preset] of Object.entries(entries)) {
+      const o = document.createElement("option");
+      o.value = `${label}:${key}`;
+      o.textContent = preset.name ?? key;
+      g.append(o);
+    }
+    presetSelect.append(g);
+  };
+
+  group("Built in", BUILTIN);
+  group("Saved", user);
+}
+
+function applyPreset(preset) {
+  replaceStack(instantiate(preset));
+  if (preset.seed != null) {
+    state.seed = preset.seed;
+    seedInput.value = String(preset.seed);
+    $("seed-value").textContent = preset.seed;
+  }
+  state.cacheKey = "";
+  invalidateCache();
+  stack.render();
+  scheduleRender();
+}
+
+presetSelect.addEventListener("change", () => {
+  const value = presetSelect.value;
+  if (!value) return;
+  const [group, key] = value.split(":");
+  const preset = group === "Built in" ? BUILTIN[key] : loadUserPresets()[key];
+  if (preset) applyPreset(preset);
+});
+
+$("preset-save").addEventListener("click", () => {
+  const name = prompt("Preset name");
+  if (!name) return;
+  try {
+    saveUserPreset(
+      name.trim().toLowerCase().replace(/\s+/g, "-"),
+      serialise(name, state.seed, state.layers)
+    );
+    populatePresets();
+    setStatus(`Saved preset “${name.trim()}”`);
+  } catch (err) {
+    setStatus(`Could not save preset: ${err.message || err}`);
+  }
+});
+
+$("preset-export").addEventListener("click", () => {
+  const spec = serialise("Untitled", state.seed, state.layers);
+  const blob = new Blob([JSON.stringify(spec, null, 2)], { type: "application/json" });
+  downloadBlob(blob, "glitchinarium-preset.json");
+});
+
+$("preset-import").addEventListener("click", async () => {
+  const file = await pickFile("application/json,.json");
+  if (!file) return;
+  try {
+    applyPreset(JSON.parse(await file.text()));
+  } catch (err) {
+    setStatus(`Could not read preset: ${err.message}`);
+  }
+});
+
+// ----------------------------------------------------------------- export
+
+function activateSeg(group, active) {
+  for (const b of group.querySelectorAll(".seg-btn")) {
+    const on = b === active;
+    b.classList.toggle("is-active", on);
+    if (b.getAttribute("role") === "radio") b.setAttribute("aria-checked", on ? "true" : "false");
+  }
+}
+
+const scaleGroup = $("export-scale");
+scaleGroup.addEventListener("click", (e) => {
+  const btn = e.target.closest(".seg-btn");
+  if (!btn) return;
+  state.scale = Number(btn.dataset.scale);
+  activateSeg(scaleGroup, btn);
+  updateExportMeta();
+});
+
+const formatGroup = $("export-format");
+const exportBtn = $("export-btn");
+
+function syncExportButtonLabel() {
+  const label = state.format === "jpg" ? "JPG" : "PNG";
+  exportBtn.textContent = `Export ${label}`;
+}
+
+formatGroup.addEventListener("click", (e) => {
+  const btn = e.target.closest(".seg-btn");
+  if (!btn) return;
+  state.format = btn.dataset.format === "jpg" ? "jpg" : "png";
+  activateSeg(formatGroup, btn);
+  syncExportButtonLabel();
+});
+
+function updateExportMeta() {
+  if (!state.image) {
+    exportLine = "";
+    exportHeavy = false;
+    paintStatus();
+    return;
+  }
+  const info = describeExport(state.image.w, state.image.h, state.scale, state.layers);
+  // One long stage pill: preview stats · export size · peak memory.
+  const bits = [info.label, `~${(info.estimatedWorkingBytes / 1e6).toFixed(0)} MB peak`];
+  if (info.clamped) bits.push("SSAA reduced");
+  exportLine = bits.join(" · ");
+  exportHeavy = info.heavy || info.clamped;
+  paintStatus();
+}
+
+exportBtn.addEventListener("click", async () => {
+  if (!state.image || state.rendering) return;
+  // Snapshot job inputs so a later stack edit cannot mutate the in-flight export.
+  // (Image load is also blocked while rendering.)
+  const job = {
+    drawable: state.image.drawable,
+    srcW: state.image.w,
+    srcH: state.image.h,
+    name: state.image.name,
+    layers: state.layers,
+    seed: state.seed,
+    multiplier: state.scale,
+    format: state.format,
+  };
+
+  state.rendering = true;
+  // Cancel any in-flight preview so it does not touch the cache mid-export.
+  previewSeq++;
+  exportBtn.disabled = true;
+  const overlay = $("overlay");
+  const fill = $("overlay-fill");
+  overlay.hidden = false;
+
+  try {
+    const { blob, width, height } = await exportImage({
+      drawable: job.drawable,
+      srcW: job.srcW,
+      srcH: job.srcH,
+      layers: job.layers,
+      seed: job.seed,
+      multiplier: job.multiplier,
+      format: job.format,
+      quality: job.format === "jpg" ? 0.92 : 0.95,
+      onProgress: ({ phase, done, total, layer, plan }) => {
+        fill.style.transform = `scaleX(${total ? done / total : 0})`;
+        const titles = {
+          decode: "Decoding…",
+          render: `Rendering ${layer?.label ?? ""}…`,
+          resolve: "Encoding…",
+          done: "Done",
+        };
+        $("overlay-title").textContent = titles[phase] ?? `${phase}…`;
+        $("overlay-note").textContent = `${plan.renderW} × ${plan.renderH} · ${done}/${total}`;
+      },
+    });
+
+    const base = job.name.replace(/\.[^.]+$/, "");
+    const ext = job.format === "jpg" ? "jpg" : "png";
+    downloadBlob(blob, `${base}-glitchinarium-${job.multiplier}x.${ext}`);
+    setStatus(`Exported ${width} × ${height} · ${ext.toUpperCase()}`);
+  } catch (err) {
+    setStatus(`Export failed: ${err.message}`);
+    console.error(err);
+  } finally {
+    overlay.hidden = true;
+    fill.style.transform = "scaleX(0)";
+    state.rendering = false;
+    exportBtn.disabled = false;
+    if (renderAfterExport) {
+      renderAfterExport = false;
+      scheduleRender();
+    }
+  }
+});
+
+// ------------------------------------------------------------------- init
+
+populatePresets();
+stack.render();
+syncExportButtonLabel();
+setStatus("Ready · drop an image");
+
+// Glyph layers measure text, so the first render must wait for the webfonts —
+// otherwise ASCII lays out against the fallback metrics and shifts once the
+// real face arrives.
+document.fonts.ready.then(() => {
+  if (state.image) scheduleRender();
+});
