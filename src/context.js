@@ -25,6 +25,17 @@ export const MAX_RENDER_EDGE = 8192;
 /** Conservative browser working-set ceiling for a single export. */
 export const MAX_WORKING_BYTES = 512 * 1024 * 1024;
 
+/**
+ * Byte ceiling for the per-layer preview snapshot cache.
+ *
+ * Each snapshot is a full-frame RGBA copy, and the preview edge tracks DPR — on
+ * a retina display that is ~13 MB per layer, retained for the life of the
+ * session. A deep stack would otherwise pin hundreds of megabytes with nothing
+ * to bound it. At this budget a realistic stack still caches every layer; only
+ * pathologically long ones lose their tail.
+ */
+export const MAX_CACHE_BYTES = 192 * 1024 * 1024;
+
 // Peak live bytes per render pixel. The base pipeline retains the decoded
 // source and accumulator; entries add each processor's largest temporary set.
 // Unknown processors get the conservative default so adding one stays safe.

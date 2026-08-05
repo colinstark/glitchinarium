@@ -29,6 +29,12 @@ jobs:
       - name: Install
         run: bun install --frozen-lockfile
 
+      # The scale contract is the invariant that breaks silently — a processor
+      # reaching for raw pixels looks fine in preview and only diverges at
+      # export. Gate the deploy on the harness that actually checks it.
+      - name: Verify
+        run: bun verify
+
       - name: Build
         run: bun run build
 

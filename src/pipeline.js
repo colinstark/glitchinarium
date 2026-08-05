@@ -11,6 +11,7 @@
  */
 
 import { cloneBuf, compositeInto, createMask, blurMask } from "./buffer.js";
+import { MAX_CACHE_BYTES } from "./context.js";
 import { PROCESSORS } from "./processors/index.js";
 
 let idCounter = 0;
@@ -282,6 +283,14 @@ export function* renderSteps(layers, source, ctx, cache = null, opts = {}) {
     }
   }
 
+  // Snapshots are full-frame RGBA copies. Sum what the surviving prefix already
+  // costs so the budget is enforced against the real retained total, not against
+  // this render's contribution alone.
+  let cachedBytes = 0;
+  if (writeCache) {
+    for (const snap of cache) cachedBytes += snap.buf.data.byteLength;
+  }
+
   if (!acc) {
     acc = cloneBuf(source);
     ctx.masks = new Map();
@@ -338,9 +347,13 @@ export function* renderSteps(layers, source, ctx, cache = null, opts = {}) {
       ctx.masks.delete(layer.id);
     }
 
-    if (writeCache) {
+    // Stop snapshotting once the budget is spent rather than dropping earlier
+    // entries: the resume scan matches a CONTIGUOUS prefix, so a hole would
+    // invalidate everything after it. Layers past the ceiling simply replay.
+    if (writeCache && cachedBytes < MAX_CACHE_BYTES) {
       const prev = cache.length ? cache[cache.length - 1] : null;
       cache.push({ key: keys[i], buf: cloneBuf(acc), masks: cloneMasks(ctx.masks, prev) });
+      cachedBytes += acc.data.byteLength;
     }
     yield { done: i + 1, total: endIndex, layer };
   }
@@ -374,10 +387,16 @@ export async function renderAsync(
   opts = {}
 ) {
   const yieldMs = opts.yieldMs ?? 8;
-  const preferTimeout = !!opts.preferTimeout;
+  // rAF lives on Window and — Chrome/Firefox only — on DedicatedWorkerGlobalScope.
+  // Reaching for it where it does not exist rejects the promise and takes the whole
+  // render down with it, so anywhere without one falls back to the timer. Off-main
+  // the timer is the better primitive anyway: a worker animation frame is gated on
+  // the tab having a rendering opportunity, and we are only yielding to drain
+  // ABORT messages, not to align with a paint.
+  const useTimeout = !!opts.preferTimeout || typeof requestAnimationFrame !== "function";
   const yieldToMain = () =>
     new Promise((r) => {
-      if (preferTimeout) setTimeout(r, 0);
+      if (useTimeout) setTimeout(r, 0);
       else requestAnimationFrame(r);
     });
 

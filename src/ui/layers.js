@@ -42,6 +42,13 @@ export function createLayerStack({
   setPreviewMaskId = () => {},
 }) {
   let dragIndex = null;
+  /**
+   * Teardown for the control panels the last render built. render() replaces
+   * every card, so anything those panels subscribed to has to be released here
+   * or it accumulates one dead listener per rebuild — and rebuilds happen on
+   * every toggle, collapse, delete, reorder and preset load.
+   */
+  let paramDisposers = [];
 
   /**
    * Insert a Mask layer just before `index` and (optionally) wire the layer
@@ -102,6 +109,13 @@ export function createLayerStack({
 
   function render() {
     const layers = getLayers();
+    for (const dispose of paramDisposers.splice(0)) {
+      try {
+        dispose();
+      } catch {
+        /* a bad disposer must not block the rebuild */
+      }
+    }
     root.replaceChildren();
 
     if (!layers.length) {
@@ -415,14 +429,20 @@ export function createLayerStack({
           touchLayerKey(layer);
           onChange();
         };
-        const { root: paramsRoot } = buildControls(proc.params, layer.params, onParams, {
-          mods: (layer.mods ??= {}),
-          masks,
-          locks: (layer.locks ??= {}),
-          layer,
-          onInsertMask: () => insertMaskAbove(index, { bind: false }),
-          maskLabel: maskOptionLabel,
-        });
+        const { root: paramsRoot, dispose } = buildControls(
+          proc.params,
+          layer.params,
+          onParams,
+          {
+            mods: (layer.mods ??= {}),
+            masks,
+            locks: (layer.locks ??= {}),
+            layer,
+            onInsertMask: () => insertMaskAbove(index, { bind: false }),
+            maskLabel: maskOptionLabel,
+          }
+        );
+        paramDisposers.push(dispose);
         body.append(paramsRoot);
 
         const warn = resolutionWarning(proc, layer);

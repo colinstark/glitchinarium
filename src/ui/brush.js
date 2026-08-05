@@ -143,8 +143,29 @@ export function attachBrush(stage, toImage) {
   stage.addEventListener("pointercancel", finish);
   stage.addEventListener("lostpointercapture", finish);
 
+  // Controls that swallow characters: typing into one of these must not also
+  // drive the brush. Ranges, colour wells and checkboxes are deliberately absent
+  // — they ignore "e" and "[", so the shortcuts stay live while you tweak them.
+  const TYPING_INPUTS = new Set([
+    "text", "search", "url", "tel", "email", "password", "number",
+    "date", "month", "week", "time", "datetime-local",
+  ]);
+  const isTyping = () => {
+    const node = document.activeElement;
+    if (!node) return false;
+    if (node.isContentEditable) return true;
+    const tag = node.tagName;
+    if (tag === "TEXTAREA" || tag === "SELECT") return true; // select does typeahead
+    if (tag === "INPUT") return TYPING_INPUTS.has((node.type || "text").toLowerCase());
+    return false;
+  };
+
   window.addEventListener("keydown", (e) => {
     if (!brushState.layer) return;
+    // Paint mode stays armed while you click into another layer's controls, so
+    // without this, typing "e" in the ASCII charset field silently toggled erase
+    // and "[" resized the brush.
+    if (isTyping()) return;
     if (e.key === "Escape") endPaint();
     else if (e.key === "[") { brushState.radius = Math.max(2, brushState.radius / 1.25); notify(); }
     else if (e.key === "]") { brushState.radius = Math.min(400, brushState.radius * 1.25); notify(); }

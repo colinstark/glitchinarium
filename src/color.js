@@ -61,12 +61,30 @@ export function hslToRgb(h, s, l) {
   return [hk(h + 1 / 3) * 255, hk(h) * 255, hk(h - 1 / 3) * 255];
 }
 
+/**
+ * `#rgb` / `#rgba` / `#rrggbb` / `#rrggbbaa` → [r, g, b]. Alpha is dropped;
+ * nothing downstream consumes it (layer opacity is the alpha channel here).
+ *
+ * The two traps this avoids: an 8-digit value overflows int32, so a bare `>>`
+ * sign-extends it and reports the wrong channels entirely (`#ff0000ff` came out
+ * blue), and 4-digit shorthand needs the same expansion 3-digit does.
+ */
 export function parseHex(hex) {
-  let s = String(hex).replace("#", "").trim();
-  if (s.length === 3) s = s[0] + s[0] + s[1] + s[1] + s[2] + s[2];
-  const n = parseInt(s, 16);
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  let s = String(hex).trim().replace(/^#/, "");
+  if (s.length === 3 || s.length === 4) {
+    s = s[0] + s[0] + s[1] + s[1] + s[2] + s[2];
+  } else if (s.length === 6 || s.length === 8) {
+    s = s.slice(0, 6);
+  } else {
+    return [0, 0, 0];
+  }
+  const n = Number.parseInt(s, 16);
+  if (!Number.isFinite(n)) return [0, 0, 0];
+  return [(n >>> 16) & 255, (n >>> 8) & 255, n & 255];
 }
+
+/** The hex forms parseHex understands. Shared by the colour input and presets. */
+export const HEX_RE = /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
 
 export function toHex(r, g, b) {
   const c = (v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0");

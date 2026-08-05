@@ -256,37 +256,74 @@ function paintField(ctx, field, w, h, strokes) {
   return field;
 }
 
-// Two preview-sized raw fields per live stroke list: the normal 900px preview
-// and the smaller interactive paint preview. Export deliberately bypasses this
-// cache, since retaining a 4x Float32 field after download could cost hundreds
-// of megabytes. Weak keys let deleted/replaced layers release both fields.
-const paintPreviewCache = new WeakMap();
+/**
+ * Preview-sized raw paint fields, keyed by LAYER ID.
+ *
+ * Not by the strokes array, and not compared by stroke identity: the render
+ * worker receives its stroke list through structuredClone, so the array and
+ * every stroke object in it are fresh identities on every patch. An
+ * identity-keyed cache missed on literally every dab, which quietly turned the
+ * incremental brush into a full re-raster of the whole stroke history off-main —
+ * cost per dab growing with everything you had already painted.
+ *
+ * So the comparison is by CONTENT: a stroke's shape parameters, plus a hash of
+ * its first `length` points. That recognises "the live stroke grew by three
+ * points" through a clone, which is the case the whole cache exists to serve.
+ *
+ * Export deliberately bypasses this: retaining a 4x Float32 field after a
+ * download could cost hundreds of megabytes.
+ */
+const paintPreviewCache = new Map();
+/** Layers kept warm. Each holds at most MAX_PAINT_SIZES preview sizes. */
+const MAX_PAINT_LAYERS = 2;
+/** The normal preview edge and the smaller interactive paint edge. */
+const MAX_PAINT_SIZES = 2;
+
 const strokeSignature = (stroke) =>
   `${stroke?.r ?? 20}|${stroke?.hardness ?? 0.5}|${stroke?.flow ?? 1}|${!!stroke?.erase}`;
+
+/**
+ * FNV-1a over the first `end` coordinates. Points are normalised 0..1 and
+ * structuredClone preserves doubles exactly, so this is stable across the wire.
+ * Hashing a PREFIX is what lets a growing stroke still match its own snapshot.
+ */
+function hashPoints(pts, end) {
+  const n = Math.min(end, pts?.length ?? 0);
+  let hash = 2166136261;
+  for (let i = 0; i < n; i++) {
+    hash = Math.imul(hash ^ ((pts[i] * 1e6) | 0), 16777619);
+  }
+  return (hash ^ n) >>> 0;
+}
+
 const snapshotStrokes = (strokes) =>
-  (strokes ?? []).map((stroke) => ({
-    stroke,
-    length: stroke?.pts?.length ?? 0,
-    signature: strokeSignature(stroke),
-  }));
+  (strokes ?? []).map((stroke) => {
+    const length = stroke?.pts?.length ?? 0;
+    return { length, signature: strokeSignature(stroke), hash: hashPoints(stroke?.pts, length) };
+  });
 
 function cachedPaintField(ctx, w, h, strokes) {
-  if (!Array.isArray(strokes) || ctx.mode !== "preview") {
+  const layerId = ctx.layerId;
+  if (!Array.isArray(strokes) || ctx.mode !== "preview" || !layerId) {
     return paintField(ctx, new Float32Array(w * h), w, h, strokes);
   }
 
-  let entries = paintPreviewCache.get(strokes);
-  if (!entries) {
-    entries = new Map();
-    paintPreviewCache.set(strokes, entries);
+  let entries = paintPreviewCache.get(layerId);
+  // Re-insert so map order is least-recently-used first.
+  if (entries) paintPreviewCache.delete(layerId);
+  else entries = new Map();
+  paintPreviewCache.set(layerId, entries);
+  while (paintPreviewCache.size > MAX_PAINT_LAYERS) {
+    paintPreviewCache.delete(paintPreviewCache.keys().next().value);
   }
+
   const sizeKey = `${w}x${h}`;
   let entry = entries.get(sizeKey);
   if (!entry) {
     const field = paintField(ctx, new Float32Array(w * h), w, h, strokes);
     entry = { w, h, field, strokes: snapshotStrokes(strokes), revision: strokes._v };
     entries.set(sizeKey, entry);
-    while (entries.size > 2) entries.delete(entries.keys().next().value);
+    while (entries.size > MAX_PAINT_SIZES) entries.delete(entries.keys().next().value);
     return field;
   }
   // Refresh recency so an occasional third preview size evicts the oldest one.
@@ -294,36 +331,54 @@ function cachedPaintField(ctx, w, h, strokes) {
   entries.set(sizeKey, entry);
 
   const before = entry.strokes;
-  const sameStroke = (index) => {
+
+  // Fast path: the revision counter is bumped on every mutation and, unlike
+  // object identity, does survive structuredClone.
+  if (
+    entry.revision != null &&
+    strokes._v != null &&
+    entry.revision === strokes._v &&
+    before.length === strokes.length
+  ) {
+    return entry.field;
+  }
+
+  /** Does stroke `index` still begin with the `length` points we already drew? */
+  const matchesPrefix = (index, length) => {
     const old = before[index];
     const current = strokes[index];
-    return old?.stroke === current && old.signature === strokeSignature(current);
+    if (!old || !current) return false;
+    if (old.signature !== strokeSignature(current)) return false;
+    if ((current.pts?.length ?? 0) < length) return false;
+    return hashPoints(current.pts, length) === old.hash;
   };
   const unchanged = (index) =>
-    sameStroke(index) && before[index].length === (strokes[index]?.pts?.length ?? 0);
+    !!before[index] &&
+    (strokes[index]?.pts?.length ?? 0) === before[index].length &&
+    matchesPrefix(index, before[index].length);
+  const prefixUnchanged = (count) => {
+    for (let i = 0; i < count; i++) if (!unchanged(i)) return false;
+    return true;
+  };
 
   let incremental = false;
   if (strokes.length === before.length && strokes.length > 0) {
     const last = strokes.length - 1;
-    const prefixOk = before.slice(0, last).every((_, index) => unchanged(index));
     const oldLength = before[last].length;
     const newLength = strokes[last]?.pts?.length ?? 0;
-    if (prefixOk && sameStroke(last) && newLength > oldLength) {
+    if (newLength > oldLength && matchesPrefix(last, oldLength) && prefixUnchanged(last)) {
       rasterStroke(ctx, entry.field, w, h, strokes[last], Math.max(0, oldLength - 2));
       incremental = true;
     }
   } else if (strokes.length === before.length + 1) {
-    const prefixOk = before.every((_, index) => unchanged(index));
-    if (prefixOk) {
+    if (prefixUnchanged(before.length)) {
       rasterStroke(ctx, entry.field, w, h, strokes[strokes.length - 1]);
       incremental = true;
     }
   }
 
   const noChange =
-    strokes.length === before.length &&
-    before.every((_, index) => unchanged(index)) &&
-    entry.revision === strokes._v;
+    !incremental && strokes.length === before.length && prefixUnchanged(before.length);
   if (!incremental && !noChange) {
     entry.field.fill(0);
     entry.field._bbox = null;
@@ -763,8 +818,15 @@ export default {
     if (p.source === "paint") {
       let bbox = fieldBBox(field, w, h);
       if (bbox && !lightPost) {
+        // The bbox is measured on the RAW field, but the published mask is read
+        // through the tear displacement — a pixel can pick up paint from up to
+        // `jitter` away, so the torn fringe lives outside the painted box. Not
+        // padding for it clipped the tear off flat at the untorn boundary.
         const pad =
-          Math.ceil(ctx.u(Math.abs(p.grow)) || 0) + Math.ceil(ctx.u(p.feather) || 0) + 1;
+          Math.ceil(ctx.u(Math.abs(p.grow)) || 0) +
+          Math.ceil(ctx.u(p.feather) || 0) +
+          Math.ceil(jitter || 0) +
+          1;
         bbox = {
           x0: Math.max(0, bbox.x0 - pad),
           y0: Math.max(0, bbox.y0 - pad),

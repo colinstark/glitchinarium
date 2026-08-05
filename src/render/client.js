@@ -74,13 +74,50 @@ function candidateWorkerUrls() {
   });
 }
 
+/** Codepoint window the glyph processors actually draw from. */
+const LATIN_LO = 0x20;
+const LATIN_HI = 0x24f;
+
+/** Hard ceiling so a change in the CDN's output cannot schedule a fetch storm. */
+const MAX_FONT_FILES = 16;
+
+/**
+ * Does a css2 `unicode-range` overlap the characters we render?
+ *
+ * A css2 sheet emits one @font-face per family, per weight AND per unicode
+ * subset — latin, latin-ext, cyrillic, greek, vietnamese… Every charset in
+ * ascii.js is ASCII or Latin supplement (the box-drawing and geometric glyphs
+ * come from the fallback face; no Google subset carries them), so downloading
+ * Cyrillic and Greek is pure waste on a cold load.
+ */
+function subsetIsUseful(unicodeRange) {
+  if (!unicodeRange) return true; // no declared range means it covers everything
+  let sawRange = false;
+  for (const part of unicodeRange.split(",")) {
+    const m = /^\s*u\+([0-9a-f?]+)(?:-([0-9a-f]+))?\s*$/i.exec(part);
+    if (!m) continue;
+    sawRange = true;
+    // `U+04??` wildcard form expands to its low and high bounds.
+    const lo = Number.parseInt(m[1].replace(/\?/g, "0"), 16);
+    const hi = m[2]
+      ? Number.parseInt(m[2], 16)
+      : Number.parseInt(m[1].replace(/\?/g, "f"), 16);
+    if (Number.isFinite(lo) && Number.isFinite(hi) && hi >= LATIN_LO && lo <= LATIN_HI) {
+      return true;
+    }
+  }
+  // Unparseable ranges are kept rather than guessed away.
+  return !sawRange;
+}
+
 /**
  * Pull the woff2 bytes behind our Google Fonts <link>s so the worker can
  * register the same faces (workers cannot inherit the document's font set).
  *
- * A css2 sheet emits one @font-face per family AND per unicode subset, so this
- * is routinely dozens of files. They are fetched in parallel, and the caller
- * must not put this on the worker's boot path — see makeWorkerClient.
+ * Faces are parsed per @font-face block so each one keeps its real weight and
+ * style — they were previously all registered as 400, which left the browser to
+ * pick between identically-declared faces. They are fetched in parallel, and the
+ * caller must not put this on the worker's boot path — see makeWorkerClient.
  */
 async function collectGoogleFontBuffers() {
   if (typeof document === "undefined") return [];
@@ -88,18 +125,29 @@ async function collectGoogleFontBuffers() {
     .map((l) => l.href)
     .filter((h) => /fonts\.googleapis\.com/i.test(h));
 
-  const wanted = new Map(); // url → family
+  const wanted = new Map(); // url → { family, weight, style }
   for (const href of sheets) {
+    if (wanted.size >= MAX_FONT_FILES) break;
     try {
       const css = await fetch(href).then((r) => r.text());
-      const faceRe =
-        /font-family:\s*['"]?([^;'"]+)['"]?[^}]*?src:\s*url\(([^)]+\.woff2[^)]*)\)/gi;
-      let m;
-      while ((m = faceRe.exec(css))) {
-        const family = m[1].trim();
-        let url = m[2].trim().replace(/^['"]|['"]$/g, "");
+      const blockRe = /@font-face\s*\{([^}]*)\}/gi;
+      let block;
+      while ((block = blockRe.exec(css))) {
+        const body = block[1];
+        const family = /font-family:\s*['"]?([^;'"]+)['"]?/i.exec(body)?.[1]?.trim();
+        const src = /src:\s*url\(([^)]+\.woff2[^)]*)\)/i.exec(body)?.[1]?.trim();
+        if (!family || !src) continue;
+        if (!subsetIsUseful(/unicode-range:\s*([^;]+)/i.exec(body)?.[1])) continue;
+
+        let url = src.replace(/^['"]|['"]$/g, "");
         if (url.startsWith("//")) url = `https:${url}`;
-        if (!wanted.has(url)) wanted.set(url, family);
+        if (wanted.has(url)) continue;
+        wanted.set(url, {
+          family,
+          weight: /font-weight:\s*([^;]+)/i.exec(body)?.[1]?.trim() || "400",
+          style: /font-style:\s*([^;]+)/i.exec(body)?.[1]?.trim() || "normal",
+        });
+        if (wanted.size >= MAX_FONT_FILES) break;
       }
     } catch {
       /* optional */
@@ -107,9 +155,9 @@ async function collectGoogleFontBuffers() {
   }
 
   const fonts = await Promise.all(
-    [...wanted].map(async ([url, family]) => {
+    [...wanted].map(async ([url, face]) => {
       try {
-        return { family, buffer: await fetch(url).then((r) => r.arrayBuffer()) };
+        return { ...face, buffer: await fetch(url).then((r) => r.arrayBuffer()) };
       } catch {
         return null;
       }

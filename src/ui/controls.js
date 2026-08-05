@@ -10,6 +10,7 @@
  */
 
 import { customFonts } from "../processors/ascii.js";
+import { HEX_RE } from "../color.js";
 import { getRenderClient } from "../render/client.js";
 import { brushState, beginPaint, endPaint, clearStrokes, undoStroke, onBrushChange } from "./brush.js";
 
@@ -52,11 +53,18 @@ export function attachScrubEvents(input) {
 
 /**
  * Build controls for `schema` bound to `params`.
- * Returns { root, refresh } — call refresh() to re-apply showIf visibility.
+ *
+ * Returns { root, refresh, dispose }:
+ *  - refresh() re-applies showIf visibility
+ *  - dispose() drops subscriptions this panel took out on module-level state.
+ *    The caller MUST call it before discarding the DOM — the layer panel is
+ *    rebuilt wholesale on every stack change, so a control that subscribes
+ *    without unsubscribing accumulates one dead listener per rebuild, forever.
  */
 export function buildControls(schema, params, onChange, ctxHint = {}) {
   const root = el("div", "params");
   const rows = [];
+  const disposers = [];
   const { mods = null, masks = [], locks = null, onInsertMask = null, maskLabel = null } = ctxHint;
   const labelMask = (m) => (maskLabel ? maskLabel(m) : `${m.id} · ${m.label}`);
 
@@ -124,7 +132,7 @@ export function buildControls(schema, params, onChange, ctxHint = {}) {
       refresh();
     };
 
-    row.append(buildInput(def, params, commit, ctxHint));
+    row.append(buildInput(def, params, commit, { ...ctxHint, disposers }));
     updateReadout(def, params[def.key], readout);
     if (def.hint) row.append(el("span", "param-hint", def.hint));
 
@@ -149,7 +157,17 @@ export function buildControls(schema, params, onChange, ctxHint = {}) {
   }
   refresh();
 
-  return { root, refresh };
+  const dispose = () => {
+    for (const off of disposers.splice(0)) {
+      try {
+        off();
+      } catch {
+        /* a bad disposer must not block the rest of the teardown */
+      }
+    }
+  };
+
+  return { root, refresh, dispose };
 }
 
 /**
@@ -364,7 +382,7 @@ function buildInput(def, params, commit, ctxHint) {
         commit(input.value);
       });
       hex.addEventListener("change", () => {
-        if (!/^#[0-9a-f]{3,8}$/i.test(hex.value.trim())) {
+        if (!HEX_RE.test(hex.value.trim())) {
           hex.value = params[def.key];
           return;
         }
@@ -555,7 +573,8 @@ function buildInput(def, params, commit, ctxHint) {
       wrap.append(el("div", "ctl-row", null), toggle, count, sliders);
       wrap.firstChild.remove();
       sync();
-      onBrushChange(sync);
+      // Unsubscribe when the panel is rebuilt — see buildControls' dispose().
+      ctxHint.disposers?.push(onBrushChange(sync));
       return wrap;
     }
 

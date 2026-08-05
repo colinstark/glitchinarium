@@ -8,6 +8,7 @@
  */
 
 import { createLayer } from "../pipeline.js";
+import { HEX_RE } from "../color.js";
 import { PROCESSORS } from "../processors/index.js";
 
 const STORE_KEY = "glitchinarium.presets.v1";
@@ -68,7 +69,7 @@ function coerceParam(def, value) {
     case "font":
       return typeof value === "string" && value ? value : structuredClone(def.default);
     case "color":
-      return typeof value === "string" && /^#[0-9a-f]{3,8}$/i.test(value.trim())
+      return typeof value === "string" && HEX_RE.test(value.trim())
         ? value.trim()
         : structuredClone(def.default);
     case "text":
@@ -441,11 +442,20 @@ export function serialise(name, seed, layers) {
   };
 }
 
+/**
+ * Preset names are user-supplied and slugged straight into a key, so the store
+ * gets a null prototype: on a plain object `all["__proto__"] = preset` would set
+ * the prototype instead of storing anything, and the preset would vanish without
+ * an error. With no prototype to shadow it becomes an ordinary own property.
+ */
 export function loadUserPresets() {
+  const empty = () => Object.create(null);
   try {
-    return JSON.parse(localStorage.getItem(STORE_KEY) ?? "{}");
+    const raw = JSON.parse(localStorage.getItem(STORE_KEY) ?? "{}");
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return empty();
+    return Object.assign(empty(), raw);
   } catch {
-    return {};
+    return empty();
   }
 }
 

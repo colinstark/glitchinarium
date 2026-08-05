@@ -28,6 +28,8 @@ let stickyLayers = null;
 let maskStamps = new Map();
 let activeJobId = 0;
 let abortRequested = false;
+/** Serialises render jobs — see the RENDER case. */
+let jobChain = Promise.resolve();
 
 /** Reused OffscreenCanvas for preview ImageBitmap encoding. */
 let bitmapCanvas = null;
@@ -148,6 +150,200 @@ async function bufToBitmap(buf) {
   }
 }
 
+/**
+ * Run one render job to completion.
+ *
+ * Callers must have already claimed `activeJobId` (see the RENDER case) so an
+ * in-flight predecessor sees itself superseded before this one starts.
+ */
+async function runRenderJob(id, job) {
+  if (job.invalidateCache) {
+    previewCache = [];
+    maskStamps = new Map();
+  }
+
+  // Layers: full DTO replaces sticky; patch merges onto one sticky layer.
+  let layers;
+  if (job.layers) {
+    stickyLayers = job.layers;
+    layers = stickyLayers;
+  } else if (job.layerPatch && stickyLayers) {
+    const patch = job.layerPatch;
+    const target = stickyLayers.find((l) => l.id === patch.id);
+    if (target) {
+      if (patch.enabled !== undefined) target.enabled = patch.enabled;
+      if (patch.opacity !== undefined) target.opacity = patch.opacity;
+      if (patch.blend !== undefined) target.blend = patch.blend;
+      if (patch.mask !== undefined) target.mask = patch.mask;
+      if (patch.maskInvert !== undefined) target.maskInvert = patch.maskInvert;
+      if (patch.maskFeather !== undefined) target.maskFeather = patch.maskFeather;
+      if (patch.params) {
+        // Full replace for slider patches; shallow merge for stroke-only paint.
+        if (patch.params.strokes != null && Object.keys(patch.params).length === 1) {
+          Object.assign(target.params, patch.params);
+        } else {
+          target.params = patch.params;
+        }
+      }
+      if (patch.mods) target.mods = patch.mods;
+    }
+    layers = stickyLayers;
+  } else if (stickyLayers) {
+    layers = stickyLayers;
+  } else {
+    throw new Error("render worker: layer stack missing");
+  }
+
+  const mode = job.mode === "export" ? "export" : "preview";
+
+  // Source: export always carries its own buffer (do not clobber preview sticky).
+  // Preview transfers when size changes, otherwise reuses sticky.
+  let source;
+  if (mode === "export") {
+    if (!job.source) throw new Error("render worker: export requires a source buffer");
+    source = bufFromTransfer(job.source);
+  } else if (job.source) {
+    stickySource = bufFromTransfer(job.source);
+    stickySourceKey = job.sourceKey ?? null;
+    source = stickySource;
+  } else if (stickySource && (job.sourceKey == null || job.sourceKey === stickySourceKey)) {
+    source = stickySource;
+  } else {
+    throw new Error("render worker: source buffer missing for this preview size");
+  }
+
+  // Superseded while queued behind the previous job. The sticky merges above had
+  // to happen anyway — they are how the main thread's edits reach us, and it
+  // stops resending them once the job is posted — but there is no point paying
+  // for pixels nobody will look at.
+  if (abortRequested || id !== activeJobId) {
+    self.postMessage({ type: MSG.ABORTED, id });
+    return;
+  }
+
+  const ctx = createContext({
+    renderW: job.renderW,
+    renderH: job.renderH,
+    ssaa: job.ssaa ?? 1,
+    seed: job.seed ?? 1,
+    mode,
+    interactivePaint: !!job.interactivePaint,
+  });
+
+  // Preview cache only when requested; paint-fast and export skip it.
+  const useCache = mode === "preview" && job.useCache !== false && !job.skipCache;
+  const cache = useCache ? previewCache : null;
+
+  const totalSteps =
+    mode === "export"
+      ? Math.max(1, layers.length) + 2
+      : Math.max(1, job.endIndex ?? layers.length);
+
+  const rendered = await renderAsync(
+    layers,
+    source,
+    ctx,
+    cache,
+    (s) => {
+      if (abortRequested || id !== activeJobId) return;
+      self.postMessage({
+        type: MSG.PROGRESS,
+        id,
+        phase: "render",
+        done: s.done,
+        total: totalSteps,
+        layerLabel: s.layer?.label ?? s.layer?.type ?? "",
+      });
+    },
+    () => abortRequested || id !== activeJobId,
+    {
+      yieldMs: job.yieldMs ?? (mode === "export" ? 6 : 8),
+      // Always the timer off-main: rAF is not implemented on
+      // DedicatedWorkerGlobalScope in every engine, and where it is, its
+      // callbacks stop firing in a backgrounded tab.
+      preferTimeout: true,
+      endIndex: job.endIndex,
+      skipCache: job.skipCache || !useCache,
+    }
+  );
+
+  if (!rendered || abortRequested || id !== activeJobId) {
+    self.postMessage({ type: MSG.ABORTED, id });
+    return;
+  }
+
+  let final = rendered;
+  if (mode === "export") {
+    const factor = Math.max(1, Math.round(job.ssaa ?? 1));
+    final = boxDownsample(rendered, factor);
+    self.postMessage({
+      type: MSG.PROGRESS,
+      id,
+      phase: "resolve",
+      done: layers.length + 1,
+      total: totalSteps,
+    });
+  }
+
+  const { masks, transferList, removedMaskIds } = packMasks(ctx, {
+    returnMasks: job.returnMasks,
+    maskDeltas: !!job.maskDeltas,
+    maskIds: job.maskIds ?? null,
+  });
+
+  // Paint-fast: main keeps the previous full-stack canvas; only masks.
+  if (job.paintOnly) {
+    self.postMessage(
+      {
+        type: MSG.RESULT,
+        id,
+        image: null,
+        bitmap: null,
+        masks,
+        removedMaskIds,
+        renderW: job.renderW,
+        renderH: job.renderH,
+        paintOnly: true,
+      },
+      transferList
+    );
+    return;
+  }
+
+  // Preview prefers ImageBitmap (GPU-friendly draw on main). Export needs Buf for encode.
+  let bitmap = null;
+  let image = null;
+  if (mode === "preview" && job.preferBitmap !== false) {
+    bitmap = await bufToBitmap(final);
+  }
+  if (!bitmap) {
+    image = bufToTransfer(final);
+    transferList.push(image.buffer);
+  } else {
+    transferList.push(bitmap);
+  }
+
+  if (abortRequested || id !== activeJobId) {
+    if (bitmap?.close) try { bitmap.close(); } catch { /* ignore */ }
+    self.postMessage({ type: MSG.ABORTED, id });
+    return;
+  }
+
+  self.postMessage(
+    {
+      type: MSG.RESULT,
+      id,
+      image,
+      bitmap,
+      masks,
+      removedMaskIds,
+      renderW: job.renderW,
+      renderH: job.renderH,
+    },
+    transferList
+  );
+}
+
 self.onmessage = async (ev) => {
   const msg = ev.data;
   if (!msg || typeof msg !== "object") return;
@@ -186,183 +382,33 @@ self.onmessage = async (ev) => {
 
       case MSG.RENDER: {
         const { id, job } = msg;
-        // Supersede any in-flight job (shouldAbort checks activeJobId).
+        // Claim the slot synchronously, on receipt: an in-flight predecessor
+        // watches `activeJobId` and must see itself superseded now, not once we
+        // get around to running.
         activeJobId = id;
         abortRequested = false;
 
-        if (job.invalidateCache) {
-          previewCache = [];
-          maskStamps = new Map();
-        }
-
-        // Layers: full DTO replaces sticky; patch merges onto one sticky layer.
-        let layers;
-        if (job.layers) {
-          stickyLayers = job.layers;
-          layers = stickyLayers;
-        } else if (job.layerPatch && stickyLayers) {
-          const patch = job.layerPatch;
-          const target = stickyLayers.find((l) => l.id === patch.id);
-          if (target) {
-            if (patch.enabled !== undefined) target.enabled = patch.enabled;
-            if (patch.opacity !== undefined) target.opacity = patch.opacity;
-            if (patch.blend !== undefined) target.blend = patch.blend;
-            if (patch.mask !== undefined) target.mask = patch.mask;
-            if (patch.maskInvert !== undefined) target.maskInvert = patch.maskInvert;
-            if (patch.maskFeather !== undefined) target.maskFeather = patch.maskFeather;
-            if (patch.params) {
-              // Full replace for slider patches; shallow merge for stroke-only paint.
-              if (patch.params.strokes != null && Object.keys(patch.params).length === 1) {
-                Object.assign(target.params, patch.params);
-              } else {
-                target.params = patch.params;
-              }
-            }
-            if (patch.mods) target.mods = patch.mods;
+        // Then queue. `onmessage` is async, so without this two renders would
+        // interleave across their yield points and both mutate `previewCache` —
+        // one appending snapshots while the other has just truncated it. The
+        // predecessor bails at its next yield, so the wait is one yield long.
+        const previous = jobChain;
+        jobChain = (async () => {
+          try {
+            await previous;
+          } catch {
+            /* a failed predecessor must not cancel its successor */
           }
-          layers = stickyLayers;
-        } else if (stickyLayers) {
-          layers = stickyLayers;
-        } else {
-          throw new Error("render worker: layer stack missing");
-        }
-
-        const mode = job.mode === "export" ? "export" : "preview";
-
-        // Source: export always carries its own buffer (do not clobber preview sticky).
-        // Preview transfers when size changes, otherwise reuses sticky.
-        let source;
-        if (mode === "export") {
-          if (!job.source) throw new Error("render worker: export requires a source buffer");
-          source = bufFromTransfer(job.source);
-        } else if (job.source) {
-          stickySource = bufFromTransfer(job.source);
-          stickySourceKey = job.sourceKey ?? null;
-          source = stickySource;
-        } else if (stickySource && (job.sourceKey == null || job.sourceKey === stickySourceKey)) {
-          source = stickySource;
-        } else {
-          throw new Error("render worker: source buffer missing for this preview size");
-        }
-
-        const ctx = createContext({
-          renderW: job.renderW,
-          renderH: job.renderH,
-          ssaa: job.ssaa ?? 1,
-          seed: job.seed ?? 1,
-          mode,
-          interactivePaint: !!job.interactivePaint,
-        });
-
-        // Preview cache only when requested; paint-fast and export skip it.
-        const useCache = mode === "preview" && job.useCache !== false && !job.skipCache;
-        const cache = useCache ? previewCache : null;
-
-        const totalSteps =
-          mode === "export"
-            ? Math.max(1, layers.length) + 2
-            : Math.max(1, job.endIndex ?? layers.length);
-
-        const rendered = await renderAsync(
-          layers,
-          source,
-          ctx,
-          cache,
-          (s) => {
-            if (abortRequested || id !== activeJobId) return;
+          try {
+            await runRenderJob(id, job);
+          } catch (err) {
             self.postMessage({
-              type: MSG.PROGRESS,
+              type: MSG.ERROR,
               id,
-              phase: "render",
-              done: s.done,
-              total: totalSteps,
-              layerLabel: s.layer?.label ?? s.layer?.type ?? "",
+              message: err?.message || String(err),
             });
-          },
-          () => abortRequested || id !== activeJobId,
-          {
-            yieldMs: job.yieldMs ?? (mode === "export" ? 6 : 8),
-            preferTimeout: mode === "export",
-            endIndex: job.endIndex,
-            skipCache: job.skipCache || !useCache,
           }
-        );
-
-        if (!rendered || abortRequested || id !== activeJobId) {
-          self.postMessage({ type: MSG.ABORTED, id });
-          break;
-        }
-
-        let final = rendered;
-        if (mode === "export") {
-          const factor = Math.max(1, Math.round(job.ssaa ?? 1));
-          final = boxDownsample(rendered, factor);
-          self.postMessage({
-            type: MSG.PROGRESS,
-            id,
-            phase: "resolve",
-            done: layers.length + 1,
-            total: totalSteps,
-          });
-        }
-
-        const { masks, transferList, removedMaskIds } = packMasks(ctx, {
-          returnMasks: job.returnMasks,
-          maskDeltas: !!job.maskDeltas,
-          maskIds: job.maskIds ?? null,
-        });
-
-        // Paint-fast: main keeps the previous full-stack canvas; only masks.
-        if (job.paintOnly) {
-          self.postMessage(
-            {
-              type: MSG.RESULT,
-              id,
-              image: null,
-              bitmap: null,
-              masks,
-              removedMaskIds,
-              renderW: job.renderW,
-              renderH: job.renderH,
-              paintOnly: true,
-            },
-            transferList
-          );
-          break;
-        }
-
-        // Preview prefers ImageBitmap (GPU-friendly draw on main). Export needs Buf for encode.
-        let bitmap = null;
-        let image = null;
-        if (mode === "preview" && job.preferBitmap !== false) {
-          bitmap = await bufToBitmap(final);
-        }
-        if (!bitmap) {
-          image = bufToTransfer(final);
-          transferList.push(image.buffer);
-        } else {
-          transferList.push(bitmap);
-        }
-
-        if (abortRequested || id !== activeJobId) {
-          if (bitmap?.close) try { bitmap.close(); } catch { /* ignore */ }
-          self.postMessage({ type: MSG.ABORTED, id });
-          break;
-        }
-
-        self.postMessage(
-          {
-            type: MSG.RESULT,
-            id,
-            image,
-            bitmap,
-            masks,
-            removedMaskIds,
-            renderW: job.renderW,
-            renderH: job.renderH,
-          },
-          transferList
-        );
+        })();
         break;
       }
 

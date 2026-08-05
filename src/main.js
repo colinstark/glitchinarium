@@ -587,6 +587,14 @@ async function renderPreview(seq) {
     }
   );
 
+  // The worker stores the transferred source before it can be superseded, so it
+  // holds this buffer whether or not the render that carried it finished.
+  // Recording that only on success meant every aborted frame — the normal case
+  // mid-scrub — re-copied and re-posted the whole preview buffer next time.
+  // (If the client silently fell back to main, the flag is moot: the local path
+  // always forces sendSource.)
+  if (sendSource) state.workerHasSource = true;
+
   if (seq !== previewSeq || state.rendering) {
     if (state.rendering) renderAfterExport = true;
     return;
@@ -606,7 +614,6 @@ async function renderPreview(seq) {
 
   previewRetries = 0;
 
-  if (sendSource) state.workerHasSource = true;
   // Full DTO landed on the worker (or local). Patches keep sticky.
   // The paint fast-path sends only a PREFIX of the stack, so it must not leave
   // the worker's DTO marked authoritative — the layers above would be lost.
@@ -902,7 +909,10 @@ const stack = createLayerStack({
   onChange: scheduleRender,
   getPreviewScale: () => {
     if (!state.image) return 0;
-    const plan = planPreview(state.image.w, state.image.h);
+    // Must match what the idle preview actually renders at — that tracks DPR, so
+    // assuming a flat PREVIEW_EDGE here reported "too fine to resolve" on retina
+    // for features that were resolving at twice the pixels.
+    const plan = planPreview(state.image.w, state.image.h, previewMaxEdge(false));
     return Math.max(plan.renderW, plan.renderH) / ARTWORK_UNITS;
   },
   getIntensity: () => randomizeIntensity,
