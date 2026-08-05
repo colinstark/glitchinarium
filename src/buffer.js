@@ -36,8 +36,25 @@ export function bufToImageData(buf) {
   return new ImageData(buf.data, buf.w, buf.h);
 }
 
+/** Create a blank canvas-like surface (DOM canvas on main, OffscreenCanvas in workers). */
+export function createSurface(w = 1, h = 1) {
+  if (typeof OffscreenCanvas === "function" && typeof document === "undefined") {
+    return new OffscreenCanvas(w, h);
+  }
+  if (typeof document !== "undefined") {
+    const c = document.createElement("canvas");
+    c.width = w;
+    c.height = h;
+    return c;
+  }
+  if (typeof OffscreenCanvas === "function") {
+    return new OffscreenCanvas(w, h);
+  }
+  throw new Error("No canvas surface available");
+}
+
 /** Draw a buffer onto a canvas, resizing the canvas to match. */
-export function bufToCanvas(buf, canvas = document.createElement("canvas")) {
+export function bufToCanvas(buf, canvas = createSurface(buf.w, buf.h)) {
   if (canvas.width !== buf.w || canvas.height !== buf.h) {
     canvas.width = buf.w;
     canvas.height = buf.h;
@@ -50,16 +67,35 @@ export function bufToCanvas(buf, canvas = document.createElement("canvas")) {
  * Decode any drawable source (HTMLImageElement, ImageBitmap, canvas) into a
  * buffer at an explicit size. Uses the browser's own resampler, which is
  * higher quality and far faster than anything we'd write here.
+ *
+ * Main-thread only (needs drawImage from a DOM/ImageBitmap source).
  */
 export function bufFromDrawable(src, w, h) {
-  const c = document.createElement("canvas");
-  c.width = w;
-  c.height = h;
+  const c = createSurface(w, h);
   const ctx = c.getContext("2d", { willReadFrequently: true });
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
   ctx.drawImage(src, 0, 0, w, h);
   return bufFromImageData(ctx.getImageData(0, 0, w, h));
+}
+
+/** Pack a Buf into a transferable ArrayBuffer message payload. */
+export function bufToTransfer(buf) {
+  // Copy so the original remains usable if the caller still needs it.
+  const copy = buf.data.buffer.slice(
+    buf.data.byteOffset,
+    buf.data.byteOffset + buf.data.byteLength
+  );
+  return { w: buf.w, h: buf.h, buffer: copy };
+}
+
+/** Rebuild a Buf from a transferable payload. */
+export function bufFromTransfer(payload) {
+  return {
+    w: payload.w,
+    h: payload.h,
+    data: new Uint8ClampedArray(payload.buffer),
+  };
 }
 
 // ---------------------------------------------------------------------------

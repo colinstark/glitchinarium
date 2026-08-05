@@ -9,3 +9,7 @@ dist/
 .impeccable.md
 PRODUCT.md
 DESIGN.md
+
+# Generated render worker at repo root (bun build / npm run dev)
+# Keep source at src/render/worker.js tracked.
+/worker.js

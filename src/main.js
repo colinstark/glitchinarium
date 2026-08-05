@@ -10,9 +10,13 @@
 import p5 from "p5";
 
 import { bufFromDrawable, bufToCanvas } from "./buffer.js";
-import { createContext, planPreview, ARTWORK_UNITS } from "./context.js";
-import { renderAsync } from "./pipeline.js";
+import { planPreview, ARTWORK_UNITS } from "./context.js";
 import { exportImage, downloadBlob, describeExport } from "./export.js";
+import {
+  getRenderClient,
+  workerSupported,
+  installRenderWorker,
+} from "./render/client.js";
 import { createLayerStack } from "./ui/layers.js";
 import { pickFile } from "./ui/controls.js";
 import { brushState, attachBrush, onBrushChange, endPaint } from "./ui/brush.js";
@@ -25,6 +29,9 @@ import {
   saveUserPreset,
 } from "./ui/presets.js";
 
+// Static entry URL so Bun HTML bundler can rewrite a real worker chunk.
+installRenderWorker(new URL("./render/worker.js", import.meta.url));
+
 const $ = (id) => document.getElementById(id);
 
 const state = {
@@ -35,10 +42,13 @@ const state = {
   /** Caps SSAA: "fast" | "balanced" | "quality" */
   exportQuality: "balanced",
   image: null, // { drawable, w, h, name }
+  /** Decoded preview buffer on main (also sticky-copied into the worker). */
   previewSource: null,
   previewCanvas: null,
-  cache: [],
+  /** Size/seed key for preview source + worker sticky source. */
   cacheKey: "",
+  /** True when the worker already holds the buffer for `cacheKey`. */
+  workerHasSource: false,
   rendering: false,
   /** Where the preview was letterboxed on the canvas — the brush needs it. */
   viewport: null,
@@ -178,36 +188,71 @@ stageResize.observe(holder);
 // ----------------------------------------------------------------- render
 
 let pending = null;
+let pendingPaintRaf = 0;
 /** True when a render was requested while export held the pipeline. */
 let renderAfterExport = false;
 /** Monotonic id so a superseded async preview can bail out. */
 let previewSeq = 0;
-/** Serialise preview runs so two async pipelines never share state.cache. */
+/** Serialise preview runs so two jobs never race on the stage canvas. */
 let previewChain = Promise.resolve();
 const PAINT_PREVIEW_EDGE = 540;
+/** Trailing debounce for slider/stack edits (ms). */
+const PREVIEW_DEBOUNCE_MS = 40;
 
-function scheduleRender() {
-  updateExportMeta();
-  // Sliders benefit from trailing debounce; a brush needs steady feedback
-  // while pointer events keep arriving, so retain the already scheduled frame.
-  if (pending) {
-    if (brushState.active) return;
-    clearTimeout(pending);
-  }
-  pending = setTimeout(() => {
-    pending = null;
-    // Bump here so an in-flight preview aborts at the next layer boundary and
-    // cannot paint a stale result after a newer request was scheduled.
-    const seq = ++previewSeq;
-    previewChain = previewChain.then(() => renderPreview(seq)).catch((err) => {
-      console.error(err);
-      setStatus(`Preview failed: ${err.message || err}`);
-    });
-  }, 40);
+const renderClient = getRenderClient();
+
+function enqueuePreview() {
+  const seq = ++previewSeq;
+  // Abort in-flight work — only the latest seq is allowed to paint the stage.
+  renderClient.abort();
+  previewChain = previewChain.then(() => renderPreview(seq)).catch((err) => {
+    console.error(err);
+    const msg = String(err?.message || err);
+    if (/worker/i.test(msg)) {
+      setStatus("Preview using main thread");
+      return;
+    }
+    setStatus(`Preview failed: ${msg}`);
+  });
 }
 
-function invalidateCache() {
-  state.cache.length = 0;
+/**
+ * Schedule a preview re-render.
+ * - Paint: coalesce to one rAF (pointermove flood → single latest job)
+ * - Everything else: trailing debounce so sliders stay smooth
+ */
+function scheduleRender() {
+  updateExportMeta();
+
+  if (brushState.active) {
+    // Drop trailing slider timer; paint path owns the schedule now.
+    if (pending) {
+      clearTimeout(pending);
+      pending = null;
+    }
+    if (pendingPaintRaf) return;
+    pendingPaintRaf = requestAnimationFrame(() => {
+      pendingPaintRaf = 0;
+      enqueuePreview();
+    });
+    return;
+  }
+
+  if (pendingPaintRaf) {
+    cancelAnimationFrame(pendingPaintRaf);
+    pendingPaintRaf = 0;
+  }
+  if (pending) clearTimeout(pending);
+  pending = setTimeout(() => {
+    pending = null;
+    enqueuePreview();
+  }, PREVIEW_DEBOUNCE_MS);
+}
+
+/** Drop layer cache (worker + local fallback). Optionally drop sticky source. */
+function invalidateCache({ clearSource = false } = {}) {
+  state.workerHasSource = clearSource ? false : state.workerHasSource;
+  renderClient.invalidateCache({ clearSource });
 }
 
 /**
@@ -218,6 +263,8 @@ function replaceStack(next) {
   if (brushState.layer) endPaint();
   state.previewMaskId = null;
   state.layers = next;
+  // Layer identities change — cache keys are invalid.
+  invalidateCache();
 }
 
 async function renderPreview(seq) {
@@ -241,59 +288,87 @@ async function renderPreview(seq) {
     state.image.h,
     painting ? PAINT_PREVIEW_EDGE : undefined
   );
-  const key = `${plan.renderW}x${plan.renderH}|${state.seed}`;
-  if (key !== state.cacheKey) {
-    // Seed and preview size both change what every layer produces, so neither
-    // is part of the per-layer cache key — they invalidate the whole thing.
-    state.previewSource = bufFromDrawable(state.image.drawable, plan.renderW, plan.renderH);
-    state.cacheKey = key;
-    invalidateCache();
+  // Source pixels depend only on image + size. Seed is not in the sticky key —
+  // it only invalidates the layer cache (processors re-roll).
+  const sourceKey = `${plan.renderW}x${plan.renderH}`;
+  let sendSource = false;
+  if (sourceKey !== state.cacheKey) {
+    state.previewSource = bufFromDrawable(
+      state.image.drawable,
+      plan.renderW,
+      plan.renderH
+    );
+    state.cacheKey = sourceKey;
+    state.workerHasSource = false;
+    invalidateCache({ clearSource: true });
+    sendSource = true;
+  } else if (!state.workerHasSource || !state.previewSource) {
+    if (!state.previewSource) {
+      state.previewSource = bufFromDrawable(
+        state.image.drawable,
+        plan.renderW,
+        plan.renderH
+      );
+    }
+    sendSource = true;
   }
-
-  const ctx = createContext({
-    renderW: plan.renderW,
-    renderH: plan.renderH,
-    ssaa: 1,
-    seed: state.seed,
-    mode: "preview",
-    // Skip feather/grow/edge-style while the brush is down.
-    interactivePaint: painting,
-  });
-
   // Mid-stroke: recompute only through the paint mask for the pink overlay.
   // Keep the last full-stack preview canvas so the image does not flicker.
-  const paintFast = painting && paintIndex >= 0 && state.previewCanvas;
-  const renderOpts = paintFast
-    ? { endIndex: paintIndex + 1, skipCache: true, yieldMs: 24, preferTimeout: true }
-    : { yieldMs: 8 };
+  const paintFast = painting && paintIndex >= 0 && !!state.previewCanvas;
 
   const t0 = performance.now();
-  const buf = await renderAsync(
-    state.layers,
-    state.previewSource,
-    ctx,
-    paintFast ? null : state.cache,
-    null,
-    () => seq !== previewSeq || state.rendering,
-    renderOpts
-  );
-  if (!buf || seq !== previewSeq || state.rendering) {
+  await renderClient.ready;
+  if (seq !== previewSeq || state.rendering) {
     if (state.rendering) renderAfterExport = true;
     return;
   }
-  const ms = performance.now() - t0;
-  state.lastMasks = ctx.masks;
 
-  if (!paintFast) {
-    state.previewCanvas = bufToCanvas(buf, state.previewCanvas ?? undefined);
+  const result = await renderClient.renderJob(
+    {
+      mode: "preview",
+      sourceBuf: state.previewSource,
+      sourceKey,
+      sendSource,
+      // Paint-fast only needs the prefix through the paint mask.
+      layers: paintFast ? state.layers.slice(0, paintIndex + 1) : state.layers,
+      seed: state.seed,
+      ssaa: 1,
+      renderW: plan.renderW,
+      renderH: plan.renderH,
+      interactivePaint: painting,
+      endIndex: paintFast ? paintIndex + 1 : undefined,
+      skipCache: paintFast,
+      useCache: !paintFast,
+      returnMasks: true,
+      paintOnly: paintFast,
+      yieldMs: paintFast ? 32 : 8,
+    },
+    {
+      shouldAbort: () => seq !== previewSeq || state.rendering,
+    }
+  );
+
+  if (!result || seq !== previewSeq || state.rendering) {
+    if (state.rendering) renderAfterExport = true;
+    return;
+  }
+
+  if (sendSource) state.workerHasSource = true;
+
+  const ms = performance.now() - t0;
+  state.lastMasks = result.masks?.size ? result.masks : state.lastMasks;
+
+  if (!paintFast && result.buf) {
+    state.previewCanvas = bufToCanvas(result.buf, state.previewCanvas ?? undefined);
   }
   sketch?.redraw();
 
   const active = state.layers.filter((l) => l.enabled).length;
+  const backend = renderClient.supported ? "worker" : "main";
   setStatus(
     paintFast
-      ? `paint · ${plan.renderW}×${plan.renderH} · ${ms.toFixed(0)} ms`
-      : `${plan.renderW}×${plan.renderH} preview · ${active}/${state.layers.length} layers · ${ms.toFixed(0)} ms`
+      ? `paint · ${plan.renderW}×${plan.renderH} · ${ms.toFixed(0)} ms · ${backend}`
+      : `${plan.renderW}×${plan.renderH} preview · ${active}/${state.layers.length} layers · ${ms.toFixed(0)} ms · ${backend}`
   );
 }
 
@@ -438,7 +513,7 @@ async function loadImageFile(file) {
     $("stage").classList.add("has-image");
     $("export-btn").disabled = false;
     state.cacheKey = "";
-    invalidateCache();
+    invalidateCache({ clearSource: true });
     // Supersede any in-flight preview that was still using the old source.
     previewSeq++;
     updateExportMeta();
@@ -535,8 +610,8 @@ seedInput.addEventListener("input", () => {
   const n = Number(seedInput.value);
   state.seed = Number.isFinite(n) ? n : 1;
   $("seed-value").textContent = state.seed;
+  // Seed does not change source pixels — only drop layer cache.
   invalidateCache();
-  state.cacheKey = "";
   scheduleRender();
 });
 
@@ -604,7 +679,6 @@ for (const cat of SCOPES) {
 
 $("shuffle-params").addEventListener("click", () => {
   randomizeParams(state.layers, scopeState, randomizeIntensity);
-  state.cacheKey = "";
   invalidateCache();
   stack.render();
   scheduleRender();
@@ -615,8 +689,7 @@ $("shuffle-stack").addEventListener("click", () => {
   state.seed = 1 + Math.floor(Math.random() * 9999);
   seedInput.value = String(state.seed);
   $("seed-value").textContent = state.seed;
-  state.cacheKey = "";
-  invalidateCache();
+  // replaceStack already invalidates layer cache; seed change keeps sticky source.
   stack.render();
   scheduleRender();
 });
@@ -658,8 +731,7 @@ function applyPreset(preset) {
     seedInput.value = String(preset.seed);
     $("seed-value").textContent = preset.seed;
   }
-  state.cacheKey = "";
-  invalidateCache();
+  // replaceStack already dropped layer cache; sticky source still valid.
   stack.render();
   scheduleRender();
 }
@@ -850,10 +922,26 @@ exportBtn.addEventListener("click", async () => {
 
 // ------------------------------------------------------------------- init
 
+// Warm the render worker (fonts + module graph). Falls back to main thread
+// if the worker cannot boot (common under some dev servers).
+renderClient.ready
+  .then(() => {
+    setStatus(
+      renderClient.supported
+        ? "Ready · drop an image · worker"
+        : "Ready · drop an image · main"
+    );
+  })
+  .catch(() => {
+    setStatus("Ready · drop an image · main");
+  });
+
 populatePresets();
 stack.render();
 syncExportButtonLabel();
-setStatus("Ready · drop an image");
+setStatus(
+  workerSupported() ? "Ready · drop an image · starting…" : "Ready · drop an image · main"
+);
 
 // Glyph layers measure text, so the first render must wait for the webfonts —
 // otherwise ASCII lays out against the fallback metrics and shifts once the

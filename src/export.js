@@ -1,17 +1,13 @@
-import { bufFromDrawable, boxDownsample, bufToCanvas } from "./buffer.js";
-import { createContext, planExport } from "./context.js";
-import { renderAsync } from "./pipeline.js";
+import { bufFromDrawable, bufToCanvas } from "./buffer.js";
+import { planExport } from "./context.js";
+import { getRenderClient } from "./render/client.js";
 
 /**
  * Export.
  *
- * The stack is re-run from the ORIGINAL image at an internal supersample
- * (quality-tier dependent), then box-downsampled to the requested size.
- * The planner reduces supersampling when the active stack would exceed the
- * browser working-memory budget.
- *
- * No layer cache here: a single snapshot at high res is hundreds of megabytes
- * and there is nothing to reuse in a one-shot render anyway.
+ * Decodes on the main thread, then runs the stack in a Web Worker when
+ * available (OffscreenCanvas + Worker). Falls back to in-process render
+ * otherwise. Encoding (toBlob) stays on main.
  */
 export async function exportImage({
   drawable,
@@ -33,37 +29,45 @@ export async function exportImage({
   onProgress?.({ phase: "decode", done: 0, total: totalSteps, plan });
   const source = bufFromDrawable(drawable, plan.renderW, plan.renderH);
 
-  const ctx = createContext({
-    renderW: plan.renderW,
-    renderH: plan.renderH,
-    ssaa: plan.ssaa,
-    seed,
-    mode: "export",
-  });
+  if (shouldAbort?.()) return null;
 
-  const rendered = await renderAsync(
-    layers,
-    source,
-    ctx,
-    null,
-    (s) => {
-      onProgress?.({
-        phase: "render",
-        done: s.done,
-        total: totalSteps,
-        layer: s.layer,
-        plan,
-      });
+  const client = getRenderClient();
+  await client.ready;
+
+  const result = await client.renderJob(
+    {
+      mode: "export",
+      sourceBuf: source,
+      sourceKey: `export|${plan.renderW}x${plan.renderH}|${seed}`,
+      sendSource: true,
+      layers,
+      seed,
+      ssaa: plan.ssaa,
+      renderW: plan.renderW,
+      renderH: plan.renderH,
+      useCache: false,
+      skipCache: true,
+      returnMasks: false,
+      yieldMs: 6,
     },
-    shouldAbort,
-    { yieldMs: 6, preferTimeout: true }
+    {
+      shouldAbort,
+      onProgress: (s) => {
+        onProgress?.({
+          phase: s.phase ?? "render",
+          done: s.done,
+          total: s.total ?? totalSteps,
+          layer: s.layer ?? (s.layerLabel ? { label: s.layerLabel } : null),
+          plan,
+        });
+      },
+    }
   );
-  if (!rendered) return null;
+
+  if (!result) return null;
 
   onProgress?.({ phase: "resolve", done: layers.length + 1, total: totalSteps, plan });
-  // plan.ssaa is integer ≥ 1; non-integer would leave the buffer at the wrong size.
-  const factor = Math.max(1, Math.round(plan.ssaa));
-  const final = boxDownsample(rendered, factor);
+  const final = result.buf;
 
   const canvas = bufToCanvas(final);
   const mime = format === "jpg" ? "image/jpeg" : format === "webp" ? "image/webp" : "image/png";

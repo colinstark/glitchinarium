@@ -240,11 +240,21 @@ export function createContext({
      */
     noiseSeed: seed,
 
-    /** Shared offscreen 2D canvas for glyph rasterisation. */
+    /**
+     * Shared 2D surface for glyph rasterisation.
+     * Uses OffscreenCanvas in workers (and modern main threads when available)
+     * so the same processors run off-main without document access.
+     */
     _glyphCanvas: null,
     glyphCanvas() {
       if (!ctx._glyphCanvas) {
-        ctx._glyphCanvas = document.createElement("canvas");
+        if (typeof OffscreenCanvas === "function") {
+          ctx._glyphCanvas = new OffscreenCanvas(renderW, renderH);
+        } else if (typeof document !== "undefined") {
+          ctx._glyphCanvas = document.createElement("canvas");
+        } else {
+          throw new Error("No canvas surface available for glyph processors");
+        }
       }
       const c = ctx._glyphCanvas;
       if (c.width !== renderW || c.height !== renderH) {

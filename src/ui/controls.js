@@ -10,6 +10,7 @@
  */
 
 import { customFonts } from "../processors/ascii.js";
+import { getRenderClient } from "../render/client.js";
 import { brushState, beginPaint, endPaint, clearStrokes, undoStroke, onBrushChange } from "./brush.js";
 
 const el = (tag, cls, text) => {
@@ -300,10 +301,13 @@ function buildInput(def, params, commit, ctxHint) {
         if (!file) return;
         const name = file.name.replace(/\.[^.]+$/, "") || "Custom Font";
         try {
-          const face = new FontFace(name, await file.arrayBuffer());
+          const buffer = await file.arrayBuffer();
+          // Separate copies: FontFace may detach its buffer; worker needs its own.
+          const face = new FontFace(name, buffer.slice(0));
           await face.load();
           document.fonts.add(face);
           customFonts.add(name);
+          getRenderClient().loadFonts([{ family: name, buffer: buffer.slice(0) }]);
           params[def.key] = name;
           fill();
           commit(name);
