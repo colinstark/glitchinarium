@@ -26,6 +26,87 @@ Layers come in three kinds:
 - **Datamosh** additionally publishes a mask of the regions it disturbed, so an ASCII
   layer can be bound to *where the image broke* rather than to a selection you drew.
 
+Every non-mask layer also has **blend mode**, **opacity**, and an optional **mask
+binding** (stencil or inverted stencil, with feather). Params marked `∿` can be driven
+by a published mask instead of a single value. Lock a param with 🔓 to keep Shuffle
+from touching it.
+
+## Processors
+
+Grouped the same way they appear in **+ Add layer**. One-line summaries; modes and
+quirks that change the look live on the layer card.
+
+### Tone
+
+| Layer | What it does |
+| --- | --- |
+| **Levels** | Exposure, contrast, gamma, saturation, optional posterize. Cheap first layer. |
+| **Gradient map** | Map luma/hue/sat onto a colour ramp. Above ASCII it recolours glyphs; below, it recolours what they sample. |
+| **Palette lock** | Snap every colour to a short palette (named, custom, or median-cut `auto`), with optional ordered dither so gradients survive as texture. |
+| **Spot colour** | Flat press ink over a luma/hue/sat band. `Preserve tone` keeps form instead of flooding. |
+
+### Halftone
+
+| Layer | What it does |
+| --- | --- |
+| **Dither** | Block-resolution quantise (Bayer, noise, Atkinson, Floyd). Optional mask-driven **subdivide** varies chunk size across the frame. |
+| **Hatch** | Marks (cross, tick, chars…) that can rotate along a curl-noise flow — engraver hatching, not a rigid grid. |
+| **Screen** | True AM print screen: fixed lattice, variable **dot size**. Mono / RGB / CMYK (classic rosette angles). |
+| **Weave** | Progressive stitch fills (cross, checker, basket, bayer). Dark = solid cloth, mid = open weave; supports subdivide. |
+
+### Glyph
+
+| Layer | What it does |
+| --- | --- |
+| **ASCII** | Glyph grid from tone. Placement: **grid**, **flow** (curl-aligned), or **phyllotaxis**. **Subdivide** + mask → variable-resolution cells. |
+| **Edge trace** | Glyphs along contours only, rotated to the edge tangent — outlines of form, not area fill. |
+| **Echo** | Offset colour copies of ink already in the stack (misregistered type/print). Keys on dark marks below it. |
+| **Scatter** | Sparse blue-noise symbols (arrows, marks, brackets…), clumped by noise rather than gridded. |
+| **Contour** | Topographic isolines of blurred luminance; optional filled bands. |
+
+### Warp
+
+| Layer | What it does |
+| --- | --- |
+| **Ripple** | Displacement by **concentric**, **catenary**, **hypar**, or **curl** fields (not just a sine). |
+| **Spiral** | **Twirl**, **logarithmic** (equiangular), or **phyllotaxis** (golden-angle) rotation. |
+| **Kaleido / Tile** | Radial folds, square/hex mirror tiles, or **trencadís** Voronoi shards with grout. |
+
+### Glitch
+
+| Layer | What it does |
+| --- | --- |
+| **Pixel sort** | Sort runs by luma/etc. Directions: axis, angle, or **flow** (streaks follow curl noise). |
+| **RGB split** | Per-channel offset: **linear**, **radial** (lens-like), or **curl**. |
+| **Datamosh** | Codec failure: smear, blocks, real 8×8 DCT, or rowshift. Can **emit a mask** of disturbed regions for layers above. |
+| **Scanline smear** | Hold-last-sample horizontal stretch — sync loss, not block drag. |
+| **Region echo** | Copy-paste rectangles (optional staircase edges + keyline). Count is seed-stable across sizes. |
+| **Block corruption** | Macroblocks of flat saturated colour in noise clusters, with sideways colour runs. |
+| **Crystal glass** | Irregular glass-brick tessellation, posterised fills, hold streaks, sparks, optional half-frame seam. |
+| **Detection** | Fake vision boxes on detail maxima (overlay, not a mask). |
+
+### Texture
+
+| Layer | What it does |
+| --- | --- |
+| **Grain** | Substrate: paper, canvas, riso, film, dust. Modulates rather than paints over — put high in the stack for “object, not filter.” |
+| **Glow** | Thresholded bloom: only highlights blur and add back, so edges stay hard. |
+| **CRT** | Scanlines, RGB grille, barrel, phosphor bleed, vignette — all spacings in artwork units. |
+
+### Frame
+
+| Layer | What it does |
+| --- | --- |
+| **Border** | Ornamental pixel lattice frame (motif from seed + unit size), corner blocks, optional outer matte. |
+
+### Mask
+
+| Layer | What it does |
+| --- | --- |
+| **Mask** | Publishes a grayscale field named like `L3` for stencils and `∿` modulation. Sources include luma, edges, saliency, noise, flow, voronoi, shapes, chroma key, and the **paint** brush. **Edge style** / **tear** define the boundary more than the source does. |
+
+Stack order is composition: top of the list runs first. Masks must sit **above** the processors that use them. Randomize scopes (Tone / Halftone / …) match these categories.
+
 ## Masks do two different jobs
 
 A mask can act as a **stencil** (where an effect applies) or as an **intensity dial**

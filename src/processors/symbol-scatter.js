@@ -5,17 +5,15 @@ import { jitteredPoints, pointRandom, noise2, curlAngle } from "../rng.js";
 /**
  * Sparse scattered marks.
  *
- * The neon √ + = π ∞ × drifting across the peaches basket, and the loose
- * annotation chips in the skater collage. Not a grid and not a fill — a handful
- * of symbols placed on a blue-noise distribution, thinned out by a noise field
- * so they clump and gap the way hand-scattered marks do.
+ * Loose annotation chips (arrows, bullets, brackets) scattered the way hand
+ * marks sit on a collage — not a grid and not a fill. Placement is a blue-noise
+ * distribution thinned by a noise field so they clump and gap.
  *
  * Point placement uses a jittered grid whose spacing is in artwork units, so
  * the same symbols land in the same places at any render size.
  */
 
 export const SYMBOL_SETS = {
-  math: "√+=×÷π∞≈≠∑",
   arrows: "→←↑↓↗↘⇢⇠",
   marks: "•◦×+·∘⁘⁙",
   brackets: "[]{}()⟨⟩",
@@ -34,9 +32,9 @@ export default {
       type: "select",
       label: "Symbols",
       options: [...Object.keys(SYMBOL_SETS), "custom"],
-      default: "math",
+      default: "marks",
     },
-    { key: "customChars", type: "text", label: "Characters", default: "√+=×", showIf: (p) => p.set === "custom" },
+    { key: "customChars", type: "text", label: "Characters", default: "•×+·", showIf: (p) => p.set === "custom" },
     { key: "spacing", type: "range", label: "Spacing", min: 4, max: 200, step: 1, default: 34, unit: "u" },
     { key: "density", type: "range", label: "Density", min: 0, max: 1, step: 0.01, default: 0.35, mod: true },
     { key: "size", type: "range", label: "Size", min: 2, max: 120, step: 0.5, default: 16, unit: "u", mod: true },
@@ -71,8 +69,9 @@ export default {
   ],
 
   apply(ctx, src, p) {
-    const chars = p.set === "custom" ? p.customChars || "+" : SYMBOL_SETS[p.set];
-    if (!chars.length) return null;
+    const chars =
+      p.set === "custom" ? p.customChars || "+" : SYMBOL_SETS[p.set] || SYMBOL_SETS.marks;
+    if (!chars?.length) return null;
 
     const { w, h } = src;
     const s = src.data;
