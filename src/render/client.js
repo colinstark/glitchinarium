@@ -656,8 +656,10 @@ function makeResilientClient() {
         }
         active = local;
         mode = "local";
-        // Paint patches need the worker sticky DTO — cannot retry on main alone.
-        if (!job.layers?.length) throw err;
+        // Paint patches need the worker sticky DTO — cannot retry on main
+        // alone. An EMPTY stack is still a valid job (identity render), so the
+        // test is for a missing array, not a falsy length.
+        if (job.layers == null) throw err;
         return runLocal();
       }
     },

@@ -279,9 +279,13 @@ function previewMaxEdge(painting) {
 
 const renderClient = getRenderClient();
 
-/** Retries when a still-current preview returns null (unexpected abort). */
+/**
+ * Consecutive retries after a still-current preview returned null (unexpected
+ * abort). Deliberately NOT keyed on the preview seq: each retry goes through
+ * scheduleRender, which mints a new seq, so a per-seq counter would reset every
+ * attempt and never reach its cap. Reset on the next successful render.
+ */
 let previewRetries = 0;
-let previewRetryForSeq = 0;
 
 function enqueuePreview() {
   const seq = ++previewSeq;
@@ -591,10 +595,6 @@ async function renderPreview(seq) {
   // Aborted (null) while still the active request — re-schedule a few times so
   // a cancelled worker job cannot strand the stage with only source metadata.
   if (!result) {
-    if (previewRetryForSeq !== seq) {
-      previewRetryForSeq = seq;
-      previewRetries = 0;
-    }
     if (previewRetries < 2) {
       previewRetries++;
       scheduleRender();
@@ -605,7 +605,6 @@ async function renderPreview(seq) {
   }
 
   previewRetries = 0;
-  previewRetryForSeq = 0;
 
   if (sendSource) state.workerHasSource = true;
   // Full DTO landed on the worker (or local). Patches keep sticky.
