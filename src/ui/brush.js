@@ -13,6 +13,8 @@
  * 6000px export.
  */
 
+import { touchLayerKey } from "../pipeline.js";
+
 export const brushState = {
   /** The layer currently being painted, or null. */
   layer: null,
@@ -58,6 +60,7 @@ export function endPaint() {
 function bumpStrokes(strokes) {
   if (!strokes) return;
   strokes._v = (strokes._v | 0) + 1;
+  if (brushState.layer) touchLayerKey(brushState.layer);
 }
 
 export function clearStrokes() {

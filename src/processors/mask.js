@@ -183,6 +183,15 @@ function saliencyField(src, field, centerBias) {
  * a mask painted while looking at a 900px preview lands in exactly the same
  * place on a 6000px export.
  */
+function expandFieldBBox(field, x0, y0, x1, y1) {
+  const b = field._bbox || { x0: Infinity, y0: Infinity, x1: -1, y1: -1 };
+  if (x0 < b.x0) b.x0 = x0;
+  if (y0 < b.y0) b.y0 = y0;
+  if (x1 > b.x1) b.x1 = x1;
+  if (y1 > b.y1) b.y1 = y1;
+  field._bbox = b;
+}
+
 function rasterStroke(ctx, field, w, h, stroke, start = 0) {
   const pts = stroke?.pts;
   if (!pts || pts.length < 2) return;
@@ -192,6 +201,9 @@ function rasterStroke(ctx, field, w, h, stroke, start = 0) {
   const erase = !!stroke.erase;
   const inner = r * hardness;
   const step = Math.max(1, r * 0.35);
+  const r2 = r * r;
+  const inner2 = inner * inner;
+  const softRange = r - inner || 1;
 
   // `start` points at the first segment not already present in the cached raw
   // field. Including both segment endpoints preserves the exact accumulation
@@ -212,14 +224,20 @@ function rasterStroke(ctx, field, w, h, stroke, start = 0) {
       const bx = Math.min(w - 1, Math.ceil(px + r));
       const ay = Math.max(0, Math.floor(py - r));
       const by = Math.min(h - 1, Math.ceil(py + r));
+      expandFieldBBox(field, ax, ay, bx, by);
 
       for (let y = ay; y <= by; y++) {
+        const dy = y - py;
+        const dy2 = dy * dy;
+        const row = y * w;
         for (let x = ax; x <= bx; x++) {
-          const d = Math.hypot(x - px, y - py);
-          if (d > r) continue;
-          const fall = d <= inner ? 1 : 1 - (d - inner) / (r - inner || 1);
+          const dx = x - px;
+          const d2 = dx * dx + dy2;
+          if (d2 > r2) continue;
+          const fall =
+            d2 <= inner2 ? 1 : 1 - (Math.sqrt(d2) - inner) / softRange;
           const add = fall * flow;
-          const j = y * w + x;
+          const j = row + x;
           field[j] = erase
             ? Math.max(0, field[j] - add)
             : Math.min(1, field[j] + add);
@@ -304,11 +322,44 @@ function cachedPaintField(ctx, w, h, strokes) {
     entry.revision === strokes._v;
   if (!incremental && !noChange) {
     entry.field.fill(0);
+    entry.field._bbox = null;
     paintField(ctx, entry.field, w, h, strokes);
   }
   entry.strokes = snapshotStrokes(strokes);
   entry.revision = strokes._v;
   return entry.field;
+}
+
+/** Tight bbox of non-zero samples; null if empty or essentially full-frame. */
+function fieldBBox(field, w, h) {
+  if (field._bbox && field._bbox.x1 >= field._bbox.x0) {
+    const b = field._bbox;
+    return {
+      x0: Math.max(0, b.x0 | 0),
+      y0: Math.max(0, b.y0 | 0),
+      x1: Math.min(w - 1, b.x1 | 0),
+      y1: Math.min(h - 1, b.y1 | 0),
+    };
+  }
+  let x0 = w;
+  let y0 = h;
+  let x1 = -1;
+  let y1 = -1;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      if (field[row + x] > 1e-4) {
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+      }
+    }
+  }
+  if (x1 < 0) return null;
+  // Nearly full-frame → not worth clipping composites.
+  if (x0 <= 1 && y0 <= 1 && x1 >= w - 2 && y1 >= h - 2) return null;
+  return { x0, y0, x1, y1 };
 }
 
 export default {
@@ -362,13 +413,19 @@ export default {
   compute(ctx, src, p) {
     const { w, h } = src;
     const s = src.data;
+    const nPix = w * h;
     // Paint supplies a cached field; all procedural sources allocate a fresh
     // one. Avoiding an unused Float32Array here removes a large allocation from
     // every pointer-driven preview render.
-    let field = p.source === "paint" ? null : new Float32Array(w * h);
+    const pooled = p.source !== "paint" && typeof ctx.acquireF32 === "function";
+    let field = p.source === "paint" ? null : pooled ? ctx.acquireF32(nPix) : new Float32Array(nPix);
+    let releaseField = pooled;
     const cx = p.center.x * w;
     const cy = p.center.y * h;
     const maxR = Math.hypot(w, h) / 2;
+    // Interactive paint: skip grow/feather/edge-style so each dab stays cheap.
+    const lightPost =
+      !!ctx.interactivePaint && p.source === "paint" && ctx.mode === "preview";
 
     switch (p.source) {
       case "channel": {
@@ -436,31 +493,36 @@ export default {
         break;
 
       case "edge": {
-        // Sobel at an artwork-unit radius rather than the fixed 1px of a
-        // textbook kernel — a 1px kernel finds completely different edges at
-        // 4x export than in the preview.
+        // Precompute luma once, then Sobel on the plane. Per-sample luma() was
+        // the dominant cost of edge masks at export resolution.
         const r = Math.max(1, Math.round(ctx.u(p.radius)));
-        const L = (x, y) => {
-          const xx = Math.max(0, Math.min(w - 1, x));
-          const yy = Math.max(0, Math.min(h - 1, y));
-          const i = (yy * w + xx) * 4;
-          return luma(s[i], s[i + 1], s[i + 2]) / 255;
+        const Lplane = typeof ctx.acquireF32 === "function" ? ctx.acquireF32(nPix) : new Float32Array(nPix);
+        for (let i = 0, q = 0; i < nPix; i++, q += 4) {
+          Lplane[i] = luma(s[q], s[q + 1], s[q + 2]) * (1 / 255);
+        }
+        const at = (x, y) => {
+          const xx = x < 0 ? 0 : x >= w ? w - 1 : x;
+          const yy = y < 0 ? 0 : y >= h ? h - 1 : y;
+          return Lplane[yy * w + xx];
         };
         let peak = 1e-6;
         for (let y = 0; y < h; y++) {
+          const row = y * w;
           for (let x = 0; x < w; x++) {
             const gx =
-              L(x + r, y - r) + 2 * L(x + r, y) + L(x + r, y + r) -
-              L(x - r, y - r) - 2 * L(x - r, y) - L(x - r, y + r);
+              at(x + r, y - r) + 2 * at(x + r, y) + at(x + r, y + r) -
+              at(x - r, y - r) - 2 * at(x - r, y) - at(x - r, y + r);
             const gy =
-              L(x - r, y + r) + 2 * L(x, y + r) + L(x + r, y + r) -
-              L(x - r, y - r) - 2 * L(x, y - r) - L(x + r, y - r);
-            const g = Math.hypot(gx, gy) / 4;
-            field[y * w + x] = g;
+              at(x - r, y + r) + 2 * at(x, y + r) + at(x + r, y + r) -
+              at(x - r, y - r) - 2 * at(x, y - r) - at(x + r, y - r);
+            const g = Math.hypot(gx, gy) * 0.25;
+            field[row + x] = g;
             if (g > peak) peak = g;
           }
         }
-        for (let i = 0; i < field.length; i++) field[i] /= peak;
+        const invPeak = 1 / peak;
+        for (let i = 0; i < nPix; i++) field[i] *= invPeak;
+        if (typeof ctx.releaseF32 === "function") ctx.releaseF32(Lplane);
         break;
       }
 
@@ -561,15 +623,64 @@ export default {
 
     // --- torn edges -------------------------------------------------------
     let read = field;
-    const jitter = ctx.u(p.edgeJitter);
+    let releaseDisplaced = false;
+    const jitter = lightPost ? 0 : ctx.u(p.edgeJitter);
     if (jitter > 0.5) {
       const jscale = Math.max(2, ctx.u(p.jitterScale));
-      const displaced = new Float32Array(w * h);
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-          const jx = (noise2(x / jscale, y / jscale, ctx.noiseSeed + 11) - 0.5) * 2 * jitter;
-          const jy = (noise2(x / jscale, y / jscale, ctx.noiseSeed + 29) - 0.5) * 2 * jitter;
-          displaced[y * w + x] = sampleField(field, w, h, x + jx, y + jy);
+      // Interactive / low-res tear: sample noise on a coarser lattice then
+      // bilinear-upsample offsets — same look family, far fewer noise2 calls.
+      const step = ctx.mode === "preview" && jitter > 8 ? 2 : 1;
+      const displaced =
+        typeof ctx.acquireF32 === "function" ? ctx.acquireF32(nPix) : new Float32Array(nPix);
+      releaseDisplaced = typeof ctx.releaseF32 === "function";
+      if (step > 1) {
+        const sw = Math.ceil(w / step);
+        const sh = Math.ceil(h / step);
+        const ox = typeof ctx.acquireF32 === "function" ? ctx.acquireF32(sw * sh) : new Float32Array(sw * sh);
+        const oy = typeof ctx.acquireF32 === "function" ? ctx.acquireF32(sw * sh) : new Float32Array(sw * sh);
+        for (let sy = 0; sy < sh; sy++) {
+          for (let sx = 0; sx < sw; sx++) {
+            const x = sx * step;
+            const y = sy * step;
+            const i = sy * sw + sx;
+            ox[i] = (noise2(x / jscale, y / jscale, ctx.noiseSeed + 11) - 0.5) * 2 * jitter;
+            oy[i] = (noise2(x / jscale, y / jscale, ctx.noiseSeed + 29) - 0.5) * 2 * jitter;
+          }
+        }
+        for (let y = 0; y < h; y++) {
+          const fy = y / step;
+          const sy0 = Math.min(sh - 1, fy | 0);
+          const sy1 = Math.min(sh - 1, sy0 + 1);
+          const ty = fy - sy0;
+          for (let x = 0; x < w; x++) {
+            const fx = x / step;
+            const sx0 = Math.min(sw - 1, fx | 0);
+            const sx1 = Math.min(sw - 1, sx0 + 1);
+            const tx = fx - sx0;
+            const i00 = sy0 * sw + sx0;
+            const i10 = sy0 * sw + sx1;
+            const i01 = sy1 * sw + sx0;
+            const i11 = sy1 * sw + sx1;
+            const jx =
+              (ox[i00] + (ox[i10] - ox[i00]) * tx) * (1 - ty) +
+              (ox[i01] + (ox[i11] - ox[i01]) * tx) * ty;
+            const jy =
+              (oy[i00] + (oy[i10] - oy[i00]) * tx) * (1 - ty) +
+              (oy[i01] + (oy[i11] - oy[i01]) * tx) * ty;
+            displaced[y * w + x] = sampleField(field, w, h, x + jx, y + jy);
+          }
+        }
+        if (typeof ctx.releaseF32 === "function") {
+          ctx.releaseF32(ox);
+          ctx.releaseF32(oy);
+        }
+      } else {
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            const jx = (noise2(x / jscale, y / jscale, ctx.noiseSeed + 11) - 0.5) * 2 * jitter;
+            const jy = (noise2(x / jscale, y / jscale, ctx.noiseSeed + 29) - 0.5) * 2 * jitter;
+            displaced[y * w + x] = sampleField(field, w, h, x + jx, y + jy);
+          }
         }
       }
       read = displaced;
@@ -585,56 +696,87 @@ export default {
       mask.data[i] = p.invert ? 1 - v : v;
     }
 
-    const grow = ctx.u(Math.abs(p.grow));
-    if (grow >= 1) morph(mask, grow, p.grow > 0);
+    if (!lightPost) {
+      const grow = ctx.u(Math.abs(p.grow));
+      if (grow >= 1) morph(mask, grow, p.grow > 0);
 
-    const feather = ctx.u(p.feather);
-    if (feather >= 0.5) blurMask(mask, feather);
+      const feather = ctx.u(p.feather);
+      if (feather >= 0.5) blurMask(mask, feather);
 
-    // --- edge style -------------------------------------------------------
-    // Applied last, on the soft ramp the feather just produced: a boundary at
-    // 0.3 coverage becomes 30% of the cells filled, which is what makes the
-    // holly reference dissolve into a checker instead of cutting cleanly.
-    if (p.edgeStyle !== "smooth") {
-      const block = Math.max(1, ctx.u(p.edgeBlock));
-      const d = mask.data;
+      // --- edge style -------------------------------------------------------
+      // Applied last, on the soft ramp the feather just produced: a boundary at
+      // 0.3 coverage becomes 30% of the cells filled, which is what makes the
+      // holly reference dissolve into a checker instead of cutting cleanly.
+      if (p.edgeStyle !== "smooth") {
+        const block = Math.max(1, ctx.u(p.edgeBlock));
+        const d = mask.data;
 
-      if (p.edgeStyle === "stairs") {
-        // Average each block, then re-threshold: quantises the boundary onto a
-        // coarse grid so it staircases.
-        const cols = Math.ceil(w / block);
-        const rows = Math.ceil(h / block);
-        for (let by = 0; by < rows; by++) {
-          for (let bx = 0; bx < cols; bx++) {
-            const x0 = Math.floor(bx * block);
-            const y0 = Math.floor(by * block);
-            const x1 = Math.min(w, Math.floor((bx + 1) * block));
-            const y1 = Math.min(h, Math.floor((by + 1) * block));
-            let sum = 0;
-            let n = 0;
-            for (let y = y0; y < y1; y++) {
-              for (let x = x0; x < x1; x++) { sum += d[y * w + x]; n++; }
-            }
-            const v = n ? (sum / n >= 0.5 ? 1 : 0) : 0;
-            for (let y = y0; y < y1; y++) {
-              for (let x = x0; x < x1; x++) d[y * w + x] = v;
+        if (p.edgeStyle === "stairs") {
+          // Average each block, then re-threshold: quantises the boundary onto a
+          // coarse grid so it staircases.
+          const cols = Math.ceil(w / block);
+          const rows = Math.ceil(h / block);
+          for (let by = 0; by < rows; by++) {
+            for (let bx = 0; bx < cols; bx++) {
+              const x0 = Math.floor(bx * block);
+              const y0 = Math.floor(by * block);
+              const x1 = Math.min(w, Math.floor((bx + 1) * block));
+              const y1 = Math.min(h, Math.floor((by + 1) * block));
+              let sum = 0;
+              let count = 0;
+              for (let y = y0; y < y1; y++) {
+                for (let x = x0; x < x1; x++) {
+                  sum += d[y * w + x];
+                  count++;
+                }
+              }
+              const v = count ? (sum / count >= 0.5 ? 1 : 0) : 0;
+              for (let y = y0; y < y1; y++) {
+                for (let x = x0; x < x1; x++) d[y * w + x] = v;
+              }
             }
           }
-        }
-      } else {
-        for (let y = 0; y < h; y++) {
-          const cyi = Math.floor(y / block);
-          for (let x = 0; x < w; x++) {
-            const cxi = Math.floor(x / block);
-            let t;
-            if (p.edgeStyle === "checker") t = checkerAt(cxi, cyi) * 0.5 + 0.25;
-            else if (p.edgeStyle === "weave") t = ((cxi + cyi) % 3) / 3 + 0.17;
-            else t = bayerAt(cxi, cyi, 8);
-            const i = y * w + x;
-            d[i] = d[i] > t ? 1 : 0;
+        } else {
+          for (let y = 0; y < h; y++) {
+            const cyi = Math.floor(y / block);
+            for (let x = 0; x < w; x++) {
+              const cxi = Math.floor(x / block);
+              let t;
+              if (p.edgeStyle === "checker") t = checkerAt(cxi, cyi) * 0.5 + 0.25;
+              else if (p.edgeStyle === "weave") t = ((cxi + cyi) % 3) / 3 + 0.17;
+              else t = bayerAt(cxi, cyi, 8);
+              const i = y * w + x;
+              d[i] = d[i] > t ? 1 : 0;
+            }
           }
         }
       }
+    }
+
+    // Paint (and sparse fields) expose a bbox so compositeInto can skip empty
+    // regions. Post-process (grow/feather) expands it when present.
+    if (p.source === "paint") {
+      let bbox = fieldBBox(field, w, h);
+      if (bbox && !lightPost) {
+        const pad =
+          Math.ceil(ctx.u(Math.abs(p.grow)) || 0) + Math.ceil(ctx.u(p.feather) || 0) + 1;
+        bbox = {
+          x0: Math.max(0, bbox.x0 - pad),
+          y0: Math.max(0, bbox.y0 - pad),
+          x1: Math.min(w - 1, bbox.x1 + pad),
+          y1: Math.min(h - 1, bbox.y1 + pad),
+        };
+      }
+      mask.bbox = bbox;
+      // Overlay / cache stamp — avoids rebuilding pink overlay on identical revs.
+      mask._rev = p.strokes?._v ?? 0;
+    }
+
+    // Return pooled scratch now that mask.data owns the final values.
+    // Never release paint-cache fields (releaseField is false for paint).
+    if (typeof ctx.releaseF32 === "function") {
+      if (releaseDisplaced && read !== field) ctx.releaseF32(read);
+      if (releaseField && field) ctx.releaseF32(field);
     }
 
     return mask;

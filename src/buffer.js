@@ -31,13 +31,17 @@ export function bufFromImageData(imgData) {
 }
 
 export function bufToImageData(buf) {
-  return new ImageData(new Uint8ClampedArray(buf.data), buf.w, buf.h);
+  // Share the underlying buffer — no intermediate clone. Callers that will
+  // mutate `buf` after painting to a canvas should clone first.
+  return new ImageData(buf.data, buf.w, buf.h);
 }
 
 /** Draw a buffer onto a canvas, resizing the canvas to match. */
 export function bufToCanvas(buf, canvas = document.createElement("canvas")) {
-  canvas.width = buf.w;
-  canvas.height = buf.h;
+  if (canvas.width !== buf.w || canvas.height !== buf.h) {
+    canvas.width = buf.w;
+    canvas.height = buf.h;
+  }
   canvas.getContext("2d").putImageData(bufToImageData(buf), 0, 0);
   return canvas;
 }
@@ -259,63 +263,87 @@ function blendChannel(mode, b, s) {
  *
  * `mask` (optional Float32 mask at the same dimensions) scales the effect
  * per-pixel, which is how the named-mask system selectively applies a layer.
+ * Mask may set `invert: true` for a zero-copy inverted view, and optional
+ * `bbox: {x0,y0,x1,y1}` to skip empty regions (paint masks).
  * `src` alpha is respected so glyph layers can draw on transparency.
  */
 export function compositeInto(dst, src, { mode = "normal", opacity = 1, mask = null } = {}) {
   const d = dst.data;
   const s = src.data;
-  const n = dst.w * dst.h;
+  const w = dst.w;
+  const h = dst.h;
   const plain = mode === "normal";
+  const maskData = mask?.data ?? null;
+  const maskInvert = !!mask?.invert;
 
-  for (let p = 0; p < n; p++) {
-    const i = p * 4;
-    let coverage = opacity;
-    if (mask) coverage *= mask.data[p];
-    const sa = Math.max(0, Math.min(1, (s[i + 3] / 255) * coverage));
-    if (sa <= 0) continue;
+  let x0 = 0;
+  let y0 = 0;
+  let x1 = w - 1;
+  let y1 = h - 1;
+  if (mask?.bbox && !maskInvert) {
+    // Inverted sparse masks are dense outside the bbox — cannot clip.
+    x0 = Math.max(0, mask.bbox.x0 | 0);
+    y0 = Math.max(0, mask.bbox.y0 | 0);
+    x1 = Math.min(w - 1, mask.bbox.x1 | 0);
+    y1 = Math.min(h - 1, mask.bbox.y1 | 0);
+    if (x1 < x0 || y1 < y0) return dst;
+  }
 
-    if (plain && sa >= 1) {
-      d[i] = s[i];
-      d[i + 1] = s[i + 1];
-      d[i + 2] = s[i + 2];
-      d[i + 3] = 255;
-      continue;
-    }
+  for (let y = y0; y <= y1; y++) {
+    let p = y * w + x0;
+    for (let x = x0; x <= x1; x++, p++) {
+      const i = p * 4;
+      let coverage = opacity;
+      if (maskData) {
+        const m = maskData[p];
+        coverage *= maskInvert ? 1 - m : m;
+      }
+      const sa = Math.max(0, Math.min(1, (s[i + 3] / 255) * coverage));
+      if (sa <= 0) continue;
 
-    const da = d[i + 3] / 255;
-    // Opaque photographs are the overwhelmingly common path. Source-over then
-    // reduces to the original three-channel lerp and needs no alpha division.
-    if (da >= 1) {
+      if (plain && sa >= 1) {
+        d[i] = s[i];
+        d[i + 1] = s[i + 1];
+        d[i + 2] = s[i + 2];
+        d[i + 3] = 255;
+        continue;
+      }
+
+      const da = d[i + 3] / 255;
+      // Opaque photographs are the overwhelmingly common path. Source-over then
+      // reduces to the original three-channel lerp and needs no alpha division.
+      if (da >= 1) {
+        for (let c = 0; c < 3; c++) {
+          const base = d[i + c];
+          const blended = plain ? s[i + c] : blendChannel(mode, base, s[i + c]);
+          d[i + c] = base + (blended - base) * sa;
+        }
+        continue;
+      }
+      if (da <= 0) {
+        d[i] = s[i];
+        d[i + 1] = s[i + 1];
+        d[i + 2] = s[i + 2];
+        d[i + 3] = sa * 255;
+        continue;
+      }
+
+      const outA = sa + da * (1 - sa);
       for (let c = 0; c < 3; c++) {
         const base = d[i + c];
-        const blended = plain ? s[i + c] : blendChannel(mode, base, s[i + c]);
-        d[i + c] = base + (blended - base) * sa;
+        const source = s[i + c];
+        const blended = plain ? source : blendChannel(mode, base, source);
+        // W3C source-over blending in premultiplied form, converted back to the
+        // straight-alpha representation used by ImageData. In particular, RGB
+        // must not be attenuated when painting onto a transparent destination.
+        const premult =
+          sa * (1 - da) * source +
+          sa * da * blended +
+          (1 - sa) * da * base;
+        d[i + c] = outA > 0 ? premult / outA : 0;
       }
-      continue;
+      d[i + 3] = outA * 255;
     }
-    if (da <= 0) {
-      d[i] = s[i];
-      d[i + 1] = s[i + 1];
-      d[i + 2] = s[i + 2];
-      d[i + 3] = sa * 255;
-      continue;
-    }
-
-    const outA = sa + da * (1 - sa);
-    for (let c = 0; c < 3; c++) {
-      const base = d[i + c];
-      const source = s[i + c];
-      const blended = plain ? source : blendChannel(mode, base, source);
-      // W3C source-over blending in premultiplied form, converted back to the
-      // straight-alpha representation used by ImageData. In particular, RGB
-      // must not be attenuated when painting onto a transparent destination.
-      const premult =
-        sa * (1 - da) * source +
-        sa * da * blended +
-        (1 - sa) * da * base;
-      d[i + c] = outA > 0 ? premult / outA : 0;
-    }
-    d[i + 3] = outA * 255;
   }
   return dst;
 }

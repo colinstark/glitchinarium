@@ -18,11 +18,21 @@ export function nextLayerId() {
   return `L${++idCounter}`;
 }
 
-/** Deep-copy a mask map so cache snapshots own their Float32 data. */
-function cloneMasks(map) {
+/**
+ * Deep-copy a mask map so cache snapshots own their Float32 data.
+ * Unchanged mask identities (same data buffer reference as previous snapshot)
+ * are shared to avoid re-copying multi-megabyte fields on every layer.
+ */
+function cloneMasks(map, prevSnap) {
   const out = new Map();
+  const prev = prevSnap?.masks;
   for (const [id, m] of map) {
-    out.set(id, { w: m.w, h: m.h, data: new Float32Array(m.data) });
+    const old = prev?.get(id);
+    if (old && old.data === m.data && old.w === m.w && old.h === m.h) {
+      out.set(id, old);
+    } else {
+      out.set(id, { w: m.w, h: m.h, data: new Float32Array(m.data), bbox: m.bbox ?? null });
+    }
   }
   return out;
 }
@@ -49,6 +59,14 @@ export function createLayer(type, overrides = {}) {
     mods: {},
     ...overrides,
   };
+}
+
+/**
+ * Hint that a layer's params changed. Kept for call-site clarity; fingerprint
+ * is always rebuilt from live params (see layerKey) so direct mutations stay safe.
+ */
+export function touchLayerKey(_layer) {
+  /* no-op: layerKey reads live params each render */
 }
 
 /**
@@ -108,6 +126,9 @@ function layerKey(layer) {
  * Derived masks are memoised per render — several layers commonly share one
  * mask with the same modifiers, and feathering at export resolution is not
  * cheap.
+ *
+ * Invert without feather is a zero-copy view (`invert: true`) so we do not
+ * allocate another full Float32 field.
  */
 function resolveMask(ctx, layer, derivedCache) {
   if (!layer.mask) return null;
@@ -118,20 +139,35 @@ function resolveMask(ctx, layer, derivedCache) {
   const hit = derivedCache.get(key);
   if (hit) return hit;
 
-  let m = base;
   const featherPx = ctx.u(layer.maskFeather);
-  if (layer.maskInvert || featherPx >= 0.5) {
+  let m = base;
+
+  if (featherPx >= 0.5) {
     m = createMask(base.w, base.h);
     if (layer.maskInvert) {
       for (let i = 0; i < base.data.length; i++) m.data[i] = 1 - base.data[i];
     } else {
       m.data.set(base.data);
     }
-    if (featherPx >= 0.5) blurMask(m, featherPx);
+    blurMask(m, featherPx);
+    if (base.bbox) m.bbox = expandBBox(base.bbox, Math.ceil(featherPx) + 1, base.w, base.h);
+  } else if (layer.maskInvert) {
+    // Zero-copy invert view — compositeInto honors `.invert`.
+    m = { w: base.w, h: base.h, data: base.data, invert: true, bbox: base.bbox ?? null };
   }
 
   derivedCache.set(key, m);
   return m;
+}
+
+function expandBBox(bbox, pad, w, h) {
+  if (!bbox) return null;
+  return {
+    x0: Math.max(0, bbox.x0 - pad),
+    y0: Math.max(0, bbox.y0 - pad),
+    x1: Math.min(w - 1, bbox.x1 + pad),
+    y1: Math.min(h - 1, bbox.y1 + pad),
+  };
 }
 
 /**
@@ -140,9 +176,14 @@ function resolveMask(ctx, layer, derivedCache) {
  * `cache` (optional) is a mutable array of per-layer snapshots. When present,
  * we resume from the deepest snapshot whose prefix still matches, so nudging
  * the last layer's slider does not recompute the first five. Pass no cache for
- * export — snapshots at 4x are far too large to keep around.
+ * export — snapshots at high res are far too large to keep around.
+ *
+ * `opts.endIndex` — exclusive end (paint fast-path stops after the mask layer).
+ * `opts.skipCache` — do not write snapshots (interactive paint).
  */
-export function* renderSteps(layers, source, ctx, cache = null) {
+export function* renderSteps(layers, source, ctx, cache = null, opts = {}) {
+  const endIndex = Math.min(layers.length, opts.endIndex ?? layers.length);
+  const writeCache = cache && !opts.skipCache;
   const keys = layers.map(layerKey);
   let start = 0;
   let acc = null;
@@ -151,11 +192,12 @@ export function* renderSteps(layers, source, ctx, cache = null) {
     let i = 0;
     while (i < cache.length && i < keys.length && cache[i].key === keys[i]) i++;
     cache.length = i;
-    if (i > 0) {
+    if (i > 0 && i <= endIndex) {
       const snap = cache[i - 1];
       acc = cloneBuf(snap.buf);
       // New Map, same buffers as the snapshot. Snapshots already deep-copied
-      // masks on store, so entries are not shared across cache slots.
+      // masks on store, so entries are not shared across cache slots unless
+      // cloneMasks deliberately shared stable identities.
       ctx.masks = new Map(snap.masks);
       start = i;
     }
@@ -166,9 +208,14 @@ export function* renderSteps(layers, source, ctx, cache = null) {
     ctx.masks = new Map();
   }
 
+  // Nothing left to run (endIndex before start, or empty range).
+  if (start >= endIndex) {
+    return acc;
+  }
+
   const derivedCache = new Map();
 
-  for (let i = start; i < layers.length; i++) {
+  for (let i = start; i < endIndex; i++) {
     const layer = layers[i];
 
     if (layer.enabled) {
@@ -194,27 +241,31 @@ export function* renderSteps(layers, source, ctx, cache = null) {
       ctx.masks.delete(layer.id);
     }
 
-    if (cache) {
-      cache.push({ key: keys[i], buf: cloneBuf(acc), masks: cloneMasks(ctx.masks) });
+    if (writeCache) {
+      const prev = cache.length ? cache[cache.length - 1] : null;
+      cache.push({ key: keys[i], buf: cloneBuf(acc), masks: cloneMasks(ctx.masks, prev) });
     }
-    yield { done: i + 1, total: layers.length, layer };
+    yield { done: i + 1, total: endIndex, layer };
   }
 
   return acc;
 }
 
 /** Drain the generator synchronously. Used by the live preview and verify. */
-export function render(layers, source, ctx, cache = null) {
-  const it = renderSteps(layers, source, ctx, cache);
+export function render(layers, source, ctx, cache = null, opts = {}) {
+  const it = renderSteps(layers, source, ctx, cache, opts);
   let step = it.next();
   while (!step.done) step = it.next();
   return step.value;
 }
 
 /**
- * Drain the generator yielding a frame between layers, so an export at 4x can
- * paint a progress overlay instead of freezing the tab with no explanation.
- * `shouldAbort` (optional) is checked between layers — returns null if aborted.
+ * Drain the generator, yielding to the event loop only when a time budget is
+ * exceeded — so export at high res can paint a progress overlay without paying
+ * a full rAF after every lightweight layer.
+ *
+ * `opts.yieldMs` — min ms of work before yielding (default 8).
+ * `opts.preferTimeout` — use setTimeout(0) instead of rAF (faster export).
  */
 export async function renderAsync(
   layers,
@@ -222,14 +273,29 @@ export async function renderAsync(
   ctx,
   cache = null,
   onProgress = null,
-  shouldAbort = null
+  shouldAbort = null,
+  opts = {}
 ) {
-  const it = renderSteps(layers, source, ctx, cache);
+  const yieldMs = opts.yieldMs ?? 8;
+  const preferTimeout = !!opts.preferTimeout;
+  const yieldToMain = () =>
+    new Promise((r) => {
+      if (preferTimeout) setTimeout(r, 0);
+      else requestAnimationFrame(r);
+    });
+
+  const it = renderSteps(layers, source, ctx, cache, opts);
   let step = it.next();
+  let lastYield = performance.now();
   while (!step.done) {
     if (shouldAbort?.()) return null;
     if (onProgress) onProgress(step.value);
-    await new Promise((r) => requestAnimationFrame(r));
+    const now = performance.now();
+    if (now - lastYield >= yieldMs) {
+      await yieldToMain();
+      lastYield = performance.now();
+      if (shouldAbort?.()) return null;
+    }
     step = it.next();
   }
   return step.value;

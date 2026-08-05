@@ -194,8 +194,9 @@ function buildModBinding(def, m, masks, onChange, ctxHint = {}) {
   };
   range.append(mk("min", "black →"), mk("max", "white →"));
 
-  const inv = el("label", "mod-field");
+  const inv = el("div", "mod-field mod-flip");
   inv.append(el("span", null, "flip"));
+  const tog = el("label", "ctl-toggle ctl-toggle-sm");
   const invInput = el("input");
   invInput.type = "checkbox";
   invInput.checked = !!m.invert;
@@ -203,7 +204,8 @@ function buildModBinding(def, m, masks, onChange, ctxHint = {}) {
     m.invert = invInput.checked;
     onChange();
   });
-  inv.append(invInput);
+  tog.append(invInput, el("span", "ctl-toggle-track"));
+  inv.append(tog);
 
   wrap.append(sel, range, inv);
   return wrap;

@@ -11,7 +11,7 @@
  */
 
 import { PROCESSORS, processorsByCategory } from "../processors/index.js";
-import { createLayer, availableMasks } from "../pipeline.js";
+import { createLayer, availableMasks, touchLayerKey } from "../pipeline.js";
 import { BLEND_MODES } from "../buffer.js";
 import { buildControls } from "./controls.js";
 import { randomizeLayer } from "./randomize.js";
@@ -105,7 +105,12 @@ export function createLayerStack({
     root.replaceChildren();
 
     if (!layers.length) {
-      root.append(el("p", "empty", "No layers yet."));
+      const empty = el("div", "empty");
+      empty.append(el("p", "empty-title", "Stack is empty"));
+      empty.append(
+        el("p", "empty-hint", "Add a layer, load a preset, or hit New")
+      );
+      root.append(empty);
       return;
     }
 
@@ -181,6 +186,7 @@ export function createLayerStack({
       power.setAttribute("aria-pressed", layer.enabled ? "true" : "false");
       power.addEventListener("click", () => {
         layer.enabled = !layer.enabled;
+        touchLayerKey(layer);
         render();
         onChange();
       });
@@ -189,6 +195,7 @@ export function createLayerStack({
       title.type = "button";
       title.setAttribute("aria-expanded", layer.collapsed ? "false" : "true");
       title.title = layer.collapsed ? "Expand layer" : "Collapse layer";
+      title.append(el("span", "layer-chevron"));
       title.append(el("span", "layer-name", layer.label));
       if (proc.kind === "mask") title.append(el("span", "layer-badge", layer.id));
       title.addEventListener("click", () => {
@@ -203,6 +210,7 @@ export function createLayerStack({
       shuffle.addEventListener("click", (e) => {
         e.stopPropagation();
         randomizeLayer(layer, getIntensity());
+        touchLayerKey(layer);
         render();
         onChange();
       });
@@ -292,6 +300,7 @@ export function createLayerStack({
           blend.value = layer.blend;
           blend.addEventListener("change", () => {
             layer.blend = blend.value;
+            touchLayerKey(layer);
             onChange();
           });
           comp.append(labelled("Blend", blend));
@@ -306,6 +315,7 @@ export function createLayerStack({
           op.addEventListener("input", () => {
             layer.opacity = Number(op.value);
             opOut.textContent = layer.opacity.toFixed(2);
+            touchLayerKey(layer);
             onChange();
           });
           comp.append(labelled("Opacity", op, opOut));
@@ -352,6 +362,7 @@ export function createLayerStack({
             }
             msel.addEventListener("change", () => {
               layer.mask = msel.value || null;
+              touchLayerKey(layer);
               render();
               onChange();
             });
@@ -365,14 +376,17 @@ export function createLayerStack({
           comp.append(maskField);
 
           if (layer.mask) {
+            const invWrap = el("label", "ctl-toggle");
             const inv = el("input");
             inv.type = "checkbox";
             inv.checked = layer.maskInvert;
             inv.addEventListener("change", () => {
               layer.maskInvert = inv.checked;
+              touchLayerKey(layer);
               onChange();
             });
-            comp.append(labelled("Invert", inv));
+            invWrap.append(inv, el("span", "ctl-toggle-track"));
+            comp.append(labelled("Invert", invWrap));
 
             const feather = el("input", "ctl-range");
             feather.type = "range";
@@ -384,6 +398,7 @@ export function createLayerStack({
             feather.addEventListener("input", () => {
               layer.maskFeather = Number(feather.value);
               fOut.textContent = `${layer.maskFeather}u`;
+              touchLayerKey(layer);
               onChange();
             });
             comp.append(labelled("Feather", feather, fOut));
@@ -394,7 +409,11 @@ export function createLayerStack({
 
         // Mods can only reference masks defined above this layer, same rule as
         // the stencil binding.
-        const { root: paramsRoot } = buildControls(proc.params, layer.params, onChange, {
+        const onParams = () => {
+          touchLayerKey(layer);
+          onChange();
+        };
+        const { root: paramsRoot } = buildControls(proc.params, layer.params, onParams, {
           mods: (layer.mods ??= {}),
           masks,
           locks: (layer.locks ??= {}),
@@ -486,11 +505,18 @@ export function createLayerStack({
   function openMenu() {
     positionMenu();
     menu.hidden = false;
+    addButton.classList.add("is-open");
+    addButton.setAttribute("aria-expanded", "true");
   }
 
   function closeMenu() {
     menu.hidden = true;
+    addButton.classList.remove("is-open");
+    addButton.setAttribute("aria-expanded", "false");
   }
+
+  addButton.setAttribute("aria-haspopup", "menu");
+  addButton.setAttribute("aria-expanded", "false");
 
   addButton.addEventListener("click", (e) => {
     e.stopPropagation();

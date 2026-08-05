@@ -51,8 +51,18 @@ export function estimateWorkingBpp(layers = []) {
   return bpp;
 }
 
-/** The pipeline always renders at this multiple of the source dimensions. */
+/** Max supersample factor for the "quality" export tier. */
 export const SUPERSAMPLE = 4;
+
+/**
+ * Export quality tiers — caps internal supersampling before memory clamps.
+ * `fast` renders at output size (ssaa=1). `quality` keeps the classic 4× path.
+ */
+export const EXPORT_QUALITY = {
+  fast: 1,
+  balanced: 2,
+  quality: 4,
+};
 
 /** Longest edge of the live preview, in pixels. */
 export const PREVIEW_EDGE = 900;
@@ -60,11 +70,13 @@ export const PREVIEW_EDGE = 900;
 /**
  * Work out the internal render size and the resolve factor for an export.
  *
- * `multiplier` is what the user asked for (1, 2 or 4). We render at 4x the
- * source and box-downsample by `4 / multiplier`, so even a 1x export is
- * supersampled.
+ * `multiplier` is the user output scale (1, 2 or 4). Internal supersampling is
+ * `min(qualityCap, SUPERSAMPLE / multiplier)`, so even 1× can be SSAA'd on the
+ * quality tier, while fast always renders 1:1 with the target.
+ *
+ * @param {string} [quality="quality"]  "fast" | "balanced" | "quality"
  */
-export function planExport(srcW, srcH, multiplier, layers = []) {
+export function planExport(srcW, srcH, multiplier, layers = [], quality = "quality") {
   let targetW = Math.round(srcW * multiplier);
   let targetH = Math.round(srcH * multiplier);
   let outputClamped = false;
@@ -79,9 +91,15 @@ export function planExport(srcW, srcH, multiplier, layers = []) {
     outputClamped = true;
   }
 
-  let ssaa = SUPERSAMPLE / multiplier;
+  const qualityCap = EXPORT_QUALITY[quality] ?? SUPERSAMPLE;
+  // Classic contract: full quality wants SUPERSAMPLE/multiplier (e.g. 4× at 1× out).
+  const idealSsaa = SUPERSAMPLE / Math.max(1, multiplier);
+  let ssaa = Math.min(qualityCap, idealSsaa);
   // SSAA factor must stay an integer ≥ 1 so boxDownsample can resolve cleanly.
-  if (ssaa < 1) ssaa = 1;
+  ssaa = Math.max(1, Math.round(ssaa));
+  // Keep ssaa a power-of-two when possible for clean box filters (1,2,4).
+  if (ssaa === 3) ssaa = 2;
+
   let renderW = targetW * ssaa;
   let renderH = targetH * ssaa;
   const workingBpp = estimateWorkingBpp(layers);
@@ -94,7 +112,7 @@ export function planExport(srcW, srcH, multiplier, layers = []) {
     (Math.max(renderW, renderH) > MAX_RENDER_EDGE || renderW * renderH > maxPixels)
   ) {
     if (renderW * renderH > maxPixels) memoryLimited = true;
-    ssaa /= 2;
+    ssaa = Math.max(1, Math.floor(ssaa / 2));
     renderW = targetW * ssaa;
     renderH = targetH * ssaa;
   }
@@ -113,16 +131,19 @@ export function planExport(srcW, srcH, multiplier, layers = []) {
     outputClamped = true;
   }
 
+  const idealAtQuality = Math.min(qualityCap, idealSsaa);
   return {
     renderW: Math.round(renderW),
     renderH: Math.round(renderH),
     targetW,
     targetH,
     ssaa,
+    quality,
+    qualityCap,
     workingBpp,
     estimatedWorkingBytes: Math.round(renderW * renderH * workingBpp),
     memoryLimited,
-    clamped: outputClamped || ssaa < SUPERSAMPLE / multiplier,
+    clamped: outputClamped || ssaa < idealAtQuality,
   };
 }
 
@@ -143,9 +164,38 @@ export function createContext({
   seed = 1,
   mode = "preview",
   onProgress = null,
+  /** While painting: skip expensive mask post-process for interactive feel. */
+  interactivePaint = false,
 }) {
   const longEdge = Math.max(renderW, renderH);
   const scale = longEdge / ARTWORK_UNITS;
+
+  /** Scratch Float32 pools keyed by length — mask stages reuse these. */
+  const f32Pool = new Map();
+  const acquireF32 = (len) => {
+    const free = f32Pool.get(len);
+    if (free?.length) return free.pop();
+    return new Float32Array(len);
+  };
+  const releaseF32 = (arr) => {
+    if (!arr) return;
+    try {
+      if (arr.buffer?.detached) return;
+    } catch {
+      return;
+    }
+    const len = arr.length;
+    let free = f32Pool.get(len);
+    if (!free) {
+      free = [];
+      f32Pool.set(len, free);
+    }
+    // Cap pool depth so a long session does not pin hundreds of export-sized buffers.
+    if (free.length < 4) {
+      arr.fill(0);
+      free.push(arr);
+    }
+  };
 
   const ctx = {
     w: renderW,
@@ -155,6 +205,9 @@ export function createContext({
     mode,
     seed,
     onProgress,
+    interactivePaint,
+    acquireF32,
+    releaseF32,
 
     /** Artwork units → render pixels. */
     u: (v) => v * scale,

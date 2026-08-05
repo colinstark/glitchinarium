@@ -130,6 +130,38 @@
               <button type="button" class="seg-btn" data-format="jpg" role="radio" aria-checked="false">JPG</button>
             </div>
           </div>
+          <div class="seg" id="export-quality" role="radiogroup" aria-label="Export quality">
+            <button
+              type="button"
+              class="seg-btn"
+              data-quality="fast"
+              role="radio"
+              aria-checked="false"
+              title="No supersampling — fastest"
+            >
+              Fast
+            </button>
+            <button
+              type="button"
+              class="seg-btn is-active"
+              data-quality="balanced"
+              role="radio"
+              aria-checked="true"
+              title="Up to 2× supersample"
+            >
+              Balanced
+            </button>
+            <button
+              type="button"
+              class="seg-btn"
+              data-quality="quality"
+              role="radio"
+              aria-checked="false"
+              title="Up to 4× supersample — sharpest"
+            >
+              Quality
+            </button>
+          </div>
           <button type="button" class="btn btn-primary" id="export-btn" disabled>Export PNG</button>
         </section>
       </aside>

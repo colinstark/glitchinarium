@@ -32,6 +32,8 @@ const state = {
   seed: 1,
   scale: 2,
   format: "png", // "png" | "jpg"
+  /** Caps SSAA: "fast" | "balanced" | "quality" */
+  exportQuality: "balanced",
   image: null, // { drawable, w, h, name }
   previewSource: null,
   previewCanvas: null,
@@ -110,33 +112,46 @@ new p5((p) => {
     g.drawImage(src, x, y, w, h);
 
     // Mask overlay while viewing or painting — pink where the mask is white.
-    // Rebuild only when the mask buffer identity changes (cache hits reuse data).
+    // Rebuild only when size / revision / buffer identity changes.
     const overlayId = brushState.layer?.id ?? state.previewMaskId;
     if (overlayId) {
       const mask = state.lastMasks?.get(overlayId);
       if (mask) {
+        const stamp =
+          mask._rev != null
+            ? `${overlayId}|${mask.w}x${mask.h}|r${mask._rev}`
+            : `${overlayId}|${mask.w}x${mask.h}|${mask.data.length}`;
+        const dataRef = mask.data;
         if (
           !quickMask ||
           quickMask.width !== mask.w ||
           quickMask.height !== mask.h ||
-          maskOverlayData !== mask.data
+          maskOverlayStamp !== stamp ||
+          (mask._rev == null && maskOverlayData !== dataRef)
         ) {
           if (!quickMask || quickMask.width !== mask.w || quickMask.height !== mask.h) {
             quickMask = document.createElement("canvas");
             quickMask.width = mask.w;
             quickMask.height = mask.h;
           }
-          maskOverlayData = mask.data;
+          maskOverlayStamp = stamp;
+          maskOverlayData = dataRef;
           const qc = quickMask.getContext("2d");
-          const img = qc.createImageData(mask.w, mask.h);
-          for (let i = 0; i < mask.data.length; i++) {
-            const v = mask.data[i];
-            img.data[i * 4] = 255;
-            img.data[i * 4 + 1] = 40;
-            img.data[i * 4 + 2] = 70;
-            img.data[i * 4 + 3] = v * 160;
+          // Reuse ImageData backing store across rebuilds of the same size.
+          if (!quickMaskImg || quickMaskImg.width !== mask.w || quickMaskImg.height !== mask.h) {
+            quickMaskImg = qc.createImageData(mask.w, mask.h);
           }
-          qc.putImageData(img, 0, 0);
+          const px = quickMaskImg.data;
+          const md = mask.data;
+          for (let i = 0, n = md.length; i < n; i++) {
+            const o = i * 4;
+            const v = md[i];
+            px[o] = 255;
+            px[o + 1] = 40;
+            px[o + 2] = 70;
+            px[o + 3] = v * 160;
+          }
+          qc.putImageData(quickMaskImg, 0, 0);
         }
         g.drawImage(quickMask, x, y, w, h);
       }
@@ -150,7 +165,9 @@ new p5((p) => {
 document.addEventListener("glitchinarium:mask-preview", () => sketch?.redraw());
 
 let quickMask = null;
-/** Last mask.data reference baked into quickMask — identity check avoids rebuilds. */
+let quickMaskImg = null;
+/** Stamp / data ref for last baked overlay — avoids full float→RGBA each frame. */
+let maskOverlayStamp = "";
 let maskOverlayData = null;
 
 // Observe the stage (not only the holder) so flex/grid reflows always refit.
@@ -213,10 +230,16 @@ async function renderPreview(seq) {
   // Superseded while waiting on the serialisation chain.
   if (seq !== previewSeq) return;
 
+  const painting = !!(brushState.active && brushState.layer);
+  const paintLayer = painting ? brushState.layer : null;
+  const paintIndex = paintLayer
+    ? state.layers.findIndex((l) => l.id === paintLayer.id)
+    : -1;
+
   const plan = planPreview(
     state.image.w,
     state.image.h,
-    brushState.active ? PAINT_PREVIEW_EDGE : undefined
+    painting ? PAINT_PREVIEW_EDGE : undefined
   );
   const key = `${plan.renderW}x${plan.renderH}|${state.seed}`;
   if (key !== state.cacheKey) {
@@ -233,17 +256,26 @@ async function renderPreview(seq) {
     ssaa: 1,
     seed: state.seed,
     mode: "preview",
+    // Skip feather/grow/edge-style while the brush is down.
+    interactivePaint: painting,
   });
 
+  // Mid-stroke: recompute only through the paint mask for the pink overlay.
+  // Keep the last full-stack preview canvas so the image does not flicker.
+  const paintFast = painting && paintIndex >= 0 && state.previewCanvas;
+  const renderOpts = paintFast
+    ? { endIndex: paintIndex + 1, skipCache: true, yieldMs: 24, preferTimeout: true }
+    : { yieldMs: 8 };
+
   const t0 = performance.now();
-  // Yield between layers so the tab stays responsive on heavy stacks.
   const buf = await renderAsync(
     state.layers,
     state.previewSource,
     ctx,
-    state.cache,
+    paintFast ? null : state.cache,
     null,
-    () => seq !== previewSeq || state.rendering
+    () => seq !== previewSeq || state.rendering,
+    renderOpts
   );
   if (!buf || seq !== previewSeq || state.rendering) {
     if (state.rendering) renderAfterExport = true;
@@ -252,12 +284,16 @@ async function renderPreview(seq) {
   const ms = performance.now() - t0;
   state.lastMasks = ctx.masks;
 
-  state.previewCanvas = bufToCanvas(buf, state.previewCanvas ?? undefined);
+  if (!paintFast) {
+    state.previewCanvas = bufToCanvas(buf, state.previewCanvas ?? undefined);
+  }
   sketch?.redraw();
 
   const active = state.layers.filter((l) => l.enabled).length;
   setStatus(
-    `${plan.renderW}×${plan.renderH} preview · ${active}/${state.layers.length} layers · ${ms.toFixed(0)} ms`
+    paintFast
+      ? `paint · ${plan.renderW}×${plan.renderH} · ${ms.toFixed(0)} ms`
+      : `${plan.renderW}×${plan.renderH} preview · ${active}/${state.layers.length} layers · ${ms.toFixed(0)} ms`
   );
 }
 
@@ -595,7 +631,7 @@ function populatePresets() {
 
   const blank = document.createElement("option");
   blank.value = "";
-  blank.textContent = "—";
+  blank.textContent = "Load preset…";
   presetSelect.append(blank);
 
   const group = (label, entries) => {
@@ -709,13 +745,34 @@ function updateExportMeta() {
     paintStatus();
     return;
   }
-  const info = describeExport(state.image.w, state.image.h, state.scale, state.layers);
+  const info = describeExport(
+    state.image.w,
+    state.image.h,
+    state.scale,
+    state.layers,
+    state.exportQuality
+  );
   // One long stage pill: preview stats · export size · peak memory.
-  const bits = [info.label, `~${(info.estimatedWorkingBytes / 1e6).toFixed(0)} MB peak`];
-  if (info.clamped) bits.push("SSAA reduced");
+  const bits = [
+    info.label,
+    `${info.ssaa}× SSAA`,
+    `~${(info.estimatedWorkingBytes / 1e6).toFixed(0)} MB peak`,
+  ];
+  if (info.clamped) bits.push("clamped");
   exportLine = bits.join(" · ");
   exportHeavy = info.heavy || info.clamped;
   paintStatus();
+}
+
+const qualityGroup = $("export-quality");
+if (qualityGroup) {
+  qualityGroup.addEventListener("click", (e) => {
+    const btn = e.target.closest(".seg-btn");
+    if (!btn?.dataset.quality) return;
+    state.exportQuality = btn.dataset.quality;
+    activateSeg(qualityGroup, btn);
+    updateExportMeta();
+  });
 }
 
 exportBtn.addEventListener("click", async () => {
@@ -731,6 +788,7 @@ exportBtn.addEventListener("click", async () => {
     seed: state.seed,
     multiplier: state.scale,
     format: state.format,
+    exportQuality: state.exportQuality,
   };
 
   state.rendering = true;
@@ -742,7 +800,7 @@ exportBtn.addEventListener("click", async () => {
   overlay.hidden = false;
 
   try {
-    const { blob, width, height } = await exportImage({
+    const result = await exportImage({
       drawable: job.drawable,
       srcW: job.srcW,
       srcH: job.srcH,
@@ -750,7 +808,9 @@ exportBtn.addEventListener("click", async () => {
       seed: job.seed,
       multiplier: job.multiplier,
       format: job.format,
+      exportQuality: job.exportQuality,
       quality: job.format === "jpg" ? 0.92 : 0.95,
+      shouldAbort: () => false,
       onProgress: ({ phase, done, total, layer, plan }) => {
         fill.style.transform = `scaleX(${total ? done / total : 0})`;
         const titles = {
@@ -760,9 +820,14 @@ exportBtn.addEventListener("click", async () => {
           done: "Done",
         };
         $("overlay-title").textContent = titles[phase] ?? `${phase}…`;
-        $("overlay-note").textContent = `${plan.renderW} × ${plan.renderH} · ${done}/${total}`;
+        $("overlay-note").textContent = `${plan.renderW} × ${plan.renderH} · ${plan.ssaa}× · ${done}/${total}`;
       },
     });
+    if (!result) {
+      setStatus("Export cancelled");
+      return;
+    }
+    const { blob, width, height } = result;
 
     const base = job.name.replace(/\.[^.]+$/, "");
     const ext = job.format === "jpg" ? "jpg" : "png";

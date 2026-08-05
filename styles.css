@@ -57,9 +57,16 @@
   --shadow-export: 0 -12px 28px -14px oklch(0 0 0 / 0.6);
 
   /* z-index scale */
+  --z-status: 3;
+  --z-export: 4;
   --z-sticky: 5;
   --z-overlay: 20;
   --z-menu: 1000;
+
+  /* Shared fills */
+  --fill-quiet: oklch(1 0 0 / 0.04);
+  --fill-hover: oklch(1 0 0 / 0.08);
+  --track: oklch(1 0 0 / 0.12);
 }
 
 *,
@@ -134,6 +141,8 @@ summary:focus-visible,
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: oklch(0.4 0.02 260 / 0.5) transparent;
+  /* Room so last layer isn't tight against the export fade. */
+  padding-bottom: var(--space-2);
 }
 
 /* Header: title + presets on one row — pinned above the scroll body */
@@ -267,16 +276,33 @@ summary:focus-visible,
 
 /* Export footer — always pinned to the panel bottom, outside the scroll. */
 .block-export {
+  position: relative;
   flex: none;
   margin-top: auto;
   background: var(--bg-elevated);
   border-top: 1px solid var(--border);
   border-bottom: none;
   box-shadow: var(--shadow-export);
-  z-index: 4;
+  z-index: var(--z-export);
   gap: var(--space-2);
   padding-top: var(--space-3);
   padding-bottom: var(--space-3);
+}
+
+/* Soft fade so scrolling layers don't hard-clip into the export bar. */
+.block-export::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  height: 1.1rem;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    oklch(0.175 0.014 260 / 0),
+    var(--bg-elevated)
+  );
 }
 
 .block-export .btn-primary {
@@ -288,7 +314,7 @@ summary:focus-visible,
 
 .btn {
   border: 1px solid var(--border-strong);
-  background: oklch(1 0 0 / 0.04);
+  background: var(--fill-quiet);
   border-radius: var(--radius-sm);
   padding: 0.42rem 0.7rem;
   cursor: pointer;
@@ -305,7 +331,7 @@ summary:focus-visible,
 
 @media (hover: hover) and (pointer: fine) {
   .btn:hover:not(:disabled) {
-    background: oklch(1 0 0 / 0.08);
+    background: var(--fill-hover);
     border-color: oklch(0.75 0.02 260 / 0.32);
   }
 
@@ -376,6 +402,13 @@ summary:focus-visible,
   border-style: dashed;
   color: var(--muted);
   border-color: var(--border-strong);
+}
+
+.btn-add.is-open {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  border-style: solid;
 }
 
 .dropzone {
@@ -561,15 +594,19 @@ summary:focus-visible,
 }
 
 .rand-details-summary::after {
-  content: "▾";
-  font-size: 0.6rem;
-  color: var(--faint);
+  content: "";
+  width: 0.38rem;
+  height: 0.38rem;
+  flex: none;
+  border-right: 1.5px solid var(--faint);
+  border-bottom: 1.5px solid var(--faint);
+  transform: rotate(45deg) translateY(-0.08rem);
   transition: transform var(--dur) var(--ease-out);
 }
 
 .rand-details-summary:hover {
   color: var(--text);
-  background: oklch(1 0 0 / 0.04);
+  background: var(--fill-quiet);
 }
 
 .rand-details[open] > .rand-details-summary {
@@ -579,7 +616,7 @@ summary:focus-visible,
 }
 
 .rand-details[open] > .rand-details-summary::after {
-  transform: rotate(-180deg);
+  transform: rotate(225deg) translateY(-0.06rem);
 }
 
 .rand-details-body {
@@ -591,21 +628,53 @@ summary:focus-visible,
 .scopes {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.3rem 0.55rem;
+  gap: 0.28rem;
 }
 
 .scope {
   display: inline-flex;
   align-items: center;
-  gap: 0.28rem;
-  font-size: 0.72rem;
+  gap: 0;
+  font-size: 0.68rem;
+  font-weight: 500;
   color: var(--muted);
   cursor: pointer;
   user-select: none;
+  padding: 0.22rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  transition:
+    color var(--dur) var(--ease-out),
+    background var(--dur) var(--ease-out),
+    border-color var(--dur) var(--ease-out);
+}
+
+.scope:has(input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.scope:has(input:checked) {
+  color: var(--text);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .scope:hover:not(:has(input:checked)) {
+    color: var(--text);
+    border-color: oklch(0.7 0.02 260 / 0.32);
+    background: var(--fill-quiet);
+  }
 }
 
 .scope input {
-  accent-color: var(--accent);
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+  pointer-events: none;
 }
 
 .param-mod {
@@ -693,7 +762,7 @@ summary:focus-visible,
 .ctl-range::-webkit-slider-runnable-track {
   height: 3px;
   border-radius: 2px;
-  background: oklch(1 0 0 / 0.12);
+  background: var(--track);
 }
 
 .ctl-range::-webkit-slider-thumb {
@@ -719,7 +788,7 @@ summary:focus-visible,
 .ctl-range::-moz-range-track {
   height: 3px;
   border-radius: 2px;
-  background: oklch(1 0 0 / 0.12);
+  background: var(--track);
 }
 
 .ctl-range::-moz-range-thumb {
@@ -793,8 +862,9 @@ summary:focus-visible,
   width: 2rem;
   height: 1.1rem;
   border-radius: 999px;
-  background: oklch(1 0 0 / 0.12);
+  background: var(--track);
   position: relative;
+  display: block;
   transition: background var(--dur) var(--ease-out);
 }
 
@@ -822,6 +892,27 @@ summary:focus-visible,
 .ctl-toggle input:focus-visible + .ctl-toggle-track {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+/* Compact toggle for dense mod-binding rows */
+.ctl-toggle-sm .ctl-toggle-track {
+  width: 1.7rem;
+  height: 0.95rem;
+}
+
+.ctl-toggle-sm .ctl-toggle-track::after {
+  width: 0.75rem;
+  height: 0.75rem;
+}
+
+.ctl-toggle-sm input:checked + .ctl-toggle-track::after {
+  transform: translateX(0.72rem);
+}
+
+.mod-flip {
+  justify-content: space-between;
+  width: 100%;
+  grid-column: 1 / -1;
 }
 
 .ctl-pad {
@@ -895,14 +986,27 @@ summary:focus-visible,
 
 .empty {
   margin: 0;
-  padding: 0.7rem 0.5rem;
-  font-size: 0.72rem;
-  color: var(--faint);
+  padding: 0.85rem 0.65rem;
   text-align: center;
   border: 1px dashed var(--border);
   border-radius: var(--radius);
   background: oklch(1 0 0 / 0.015);
+  display: grid;
+  gap: 0.22rem;
   line-height: 1.35;
+}
+
+.empty-title {
+  margin: 0;
+  font-size: 0.76rem;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.empty-hint {
+  margin: 0;
+  font-size: 0.68rem;
+  color: var(--faint);
 }
 
 .layer {
@@ -1015,7 +1119,7 @@ summary:focus-visible,
 .layer-title {
   flex: 1 1 auto;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 0.3rem;
   border: none;
   background: transparent;
@@ -1028,10 +1132,26 @@ summary:focus-visible,
   border-radius: var(--radius-xs);
 }
 
+.layer-chevron {
+  flex: none;
+  width: 0.36rem;
+  height: 0.36rem;
+  border-right: 1.5px solid var(--faint);
+  border-bottom: 1.5px solid var(--faint);
+  transform: rotate(45deg) translateY(-0.06rem);
+  transition: transform var(--dur) var(--ease-out);
+  opacity: 0.85;
+}
+
+.layer-title[aria-expanded="false"] .layer-chevron {
+  transform: rotate(-45deg) translateY(0);
+}
+
 .layer-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
 }
 
 .layer-badge {
@@ -1222,10 +1342,17 @@ summary:focus-visible,
     transform var(--dur) var(--ease-out);
 }
 
+.seg-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  z-index: 1;
+  position: relative;
+}
+
 @media (hover: hover) and (pointer: fine) {
   .seg-btn:hover:not(.is-active) {
     color: var(--text);
-    background: oklch(1 0 0 / 0.04);
+    background: var(--fill-quiet);
   }
 }
 
@@ -1237,6 +1364,10 @@ summary:focus-visible,
   background: var(--accent);
   color: var(--accent-ink);
   font-weight: 600;
+}
+
+.seg-btn.is-active:focus-visible {
+  outline-color: var(--accent-ink);
 }
 
 .seg-btn + .seg-btn {
@@ -1266,11 +1397,20 @@ summary:focus-visible,
   min-width: 0;
 }
 
+#export-quality {
+  width: 100%;
+}
+
+#export-quality .seg-btn {
+  font-family: var(--font);
+  font-size: 0.72rem;
+}
+
 .status {
   position: absolute;
   left: 0.85rem;
   bottom: 0.85rem;
-  z-index: 3;
+  z-index: var(--z-status);
   max-width: calc(100% - 1.7rem);
   margin: 0;
   font-family: var(--mono);
@@ -1370,7 +1510,7 @@ summary:focus-visible,
 .stage-empty-title {
   margin: 0;
   font-size: 0.95rem;
-  font-weight: 550;
+  font-weight: 500;
   color: var(--muted);
   letter-spacing: -0.01em;
 }
@@ -1443,7 +1583,7 @@ summary:focus-visible,
 .overlay-bar {
   height: 3px;
   border-radius: 2px;
-  background: oklch(1 0 0 / 0.1);
+  background: var(--track);
   overflow: hidden;
 }
 
