@@ -4,8 +4,8 @@
  * A Buf is { w, h, data: Uint8ClampedArray } with data.length === w * h * 4.
  * A Mask is { w, h, data: Float32Array } with values in 0..1.
  *
- * Nothing here knows about p5. p5 only ever hands us an ImageData-shaped thing
- * at the very start and takes one back at the very end.
+ * Nothing here knows about the stage canvas. Callers hand us ImageData-shaped
+ * things (or drawables) at the edges of the pipeline.
  */
 
 export function createBuf(w, h) {

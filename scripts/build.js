@@ -1,8 +1,8 @@
 /**
  * Production static build for GitHub Pages.
  *
- * Bundles the ES module graph (including p5) into dist/main.js, the render
- * worker into dist/render.worker.js, copies CSS, and rewrites index.html.
+ * Bundles the ES module graph into dist/main.js, the render worker into
+ * dist/worker.js, copies CSS, and rewrites index.html.
  */
 import { mkdir, cp, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";

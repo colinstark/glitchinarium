@@ -184,8 +184,7 @@ hard edges survive the downsample instead of turning to grey.
 
 ## Notes
 
-- p5 runs in instance mode and owns exactly one job: the canvas that displays the
-  preview. All image processing is plain typed arrays — p5's per-pixel API is orders of
-  magnitude too slow for a 4× export.
+- The stage is a plain Canvas 2D element that letterboxes the preview. All image
+  processing is plain typed arrays — never through a sketch library.
 - `@napi-rs/canvas` is a **dev** dependency used only by `verify.js` to run the pipeline
   headlessly. It is not part of the app.

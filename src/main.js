@@ -1,13 +1,10 @@
 /**
  * App bootstrap.
  *
- * p5 runs in instance mode and owns exactly one job: the canvas that displays
- * the preview. Every pixel of actual image processing happens in the pipeline
- * on plain typed arrays — p5's per-pixel API is orders of magnitude too slow
- * for a 4x export, and going through it would defeat the whole design.
+ * The stage is a plain Canvas 2D element that letterboxes the preview. Every
+ * pixel of actual image processing happens in the pipeline on typed arrays —
+ * never through a sketch library.
  */
-
-import p5 from "p5";
 
 import { bufFromDrawable, bufToCanvas } from "./buffer.js";
 import { planPreview, ARTWORK_UNITS } from "./context.js";
@@ -58,11 +55,27 @@ const state = {
   previewMaskId: null,
 };
 
-// --------------------------------------------------------------------- p5
+// ----------------------------------------------------------------- stage
 
 const holder = $("canvas-holder");
 const stage = $("stage");
-let sketch = null;
+
+const stageCanvas = document.createElement("canvas");
+stageCanvas.style.width = "100%";
+stageCanvas.style.height = "100%";
+stageCanvas.style.display = "block";
+holder.appendChild(stageCanvas);
+const stageCtx = stageCanvas.getContext("2d");
+
+/** Logical buffer size in CSS-pixel units (no devicePixelRatio scaling). */
+let stageW = 1;
+let stageH = 1;
+
+let quickMask = null;
+let quickMaskImg = null;
+/** Stamp / data ref for last baked overlay — avoids full float→RGBA each frame. */
+let maskOverlayStamp = "";
+let maskOverlayData = null;
 
 /** Stage size in CSS pixels — never trust a 0×0 first paint. */
 function stageSize() {
@@ -71,114 +84,95 @@ function stageSize() {
   return { w, h };
 }
 
-/** Keep the p5 buffer matched to the stage so letterboxing stays accurate. */
+/** Keep the drawing buffer matched to the stage so letterboxing stays accurate. */
 function fitStage() {
-  if (!sketch) return;
   const { w, h } = stageSize();
-  if (sketch.width !== w || sketch.height !== h) {
-    sketch.resizeCanvas(w, h);
+  if (stageW !== w || stageH !== h) {
+    stageW = w;
+    stageH = h;
+    stageCanvas.width = w;
+    stageCanvas.height = h;
   }
-  // p5 sets fixed px styles; force the element to fill the holder so CSS resize
-  // and the drawing buffer stay in lockstep via getBoundingClientRect mapping.
-  const canvas = sketch.canvas;
-  if (canvas) {
-    canvas.style.width = "100%";
-    canvas.style.height = "100%";
-  }
-  sketch.redraw();
+  // CSS size stays 100% so layout reflows and getBoundingClientRect stay aligned
+  // with the drawing buffer (width/height attributes = CSS pixel units).
+  paintStage();
 }
 
-new p5((p) => {
-  sketch = p;
+/** Blit the preview (and optional mask overlay) into the stage with letterboxing. */
+function paintStage() {
+  stageCtx.clearRect(0, 0, stageW, stageH);
+  const src = state.previewCanvas;
+  if (!src) {
+    state.viewport = null;
+    return;
+  }
 
-  p.setup = () => {
-    const { w, h } = stageSize();
-    const c = p.createCanvas(w, h);
-    c.parent(holder);
-    p.noLoop();
-    // Match holder after layout settles (first paint can be 0×0 without absolute fill).
-    queueMicrotask(fitStage);
-  };
+  // Letterbox the preview into the stage with a small margin.
+  const k = Math.min(stageW / src.width, stageH / src.height) * 0.96;
+  const w = src.width * k;
+  const h = src.height * k;
+  const x = (stageW - w) / 2;
+  const y = (stageH - h) / 2;
+  state.viewport = { x, y, w, h };
 
-  p.draw = () => {
-    p.clear();
-    const src = state.previewCanvas;
-    if (!src) {
-      state.viewport = null;
-      return;
-    }
+  stageCtx.imageSmoothingEnabled = true;
+  stageCtx.imageSmoothingQuality = "high";
+  stageCtx.drawImage(src, x, y, w, h);
 
-    // Letterbox the preview into the stage with a small margin.
-    const k = Math.min(p.width / src.width, p.height / src.height) * 0.96;
-    const w = src.width * k;
-    const h = src.height * k;
-    const x = (p.width - w) / 2;
-    const y = (p.height - h) / 2;
-    state.viewport = { x, y, w, h };
-
-    const g = p.drawingContext;
-    g.imageSmoothingEnabled = true;
-    g.imageSmoothingQuality = "high";
-    g.drawImage(src, x, y, w, h);
-
-    // Mask overlay while viewing or painting — pink where the mask is white.
-    // Rebuild only when size / revision / buffer identity changes.
-    const overlayId = brushState.layer?.id ?? state.previewMaskId;
-    if (overlayId) {
-      const mask = state.lastMasks?.get(overlayId);
-      if (mask) {
-        const stamp =
-          mask._rev != null
-            ? `${overlayId}|${mask.w}x${mask.h}|r${mask._rev}`
-            : `${overlayId}|${mask.w}x${mask.h}|${mask.data.length}`;
-        const dataRef = mask.data;
-        if (
-          !quickMask ||
-          quickMask.width !== mask.w ||
-          quickMask.height !== mask.h ||
-          maskOverlayStamp !== stamp ||
-          (mask._rev == null && maskOverlayData !== dataRef)
-        ) {
-          if (!quickMask || quickMask.width !== mask.w || quickMask.height !== mask.h) {
-            quickMask = document.createElement("canvas");
-            quickMask.width = mask.w;
-            quickMask.height = mask.h;
-          }
-          maskOverlayStamp = stamp;
-          maskOverlayData = dataRef;
-          const qc = quickMask.getContext("2d");
-          // Reuse ImageData backing store across rebuilds of the same size.
-          if (!quickMaskImg || quickMaskImg.width !== mask.w || quickMaskImg.height !== mask.h) {
-            quickMaskImg = qc.createImageData(mask.w, mask.h);
-          }
-          const px = quickMaskImg.data;
-          const md = mask.data;
-          for (let i = 0, n = md.length; i < n; i++) {
-            const o = i * 4;
-            const v = md[i];
-            px[o] = 255;
-            px[o + 1] = 40;
-            px[o + 2] = 70;
-            px[o + 3] = v * 160;
-          }
-          qc.putImageData(quickMaskImg, 0, 0);
+  // Mask overlay while viewing or painting — pink where the mask is white.
+  // Rebuild only when size / revision / buffer identity changes.
+  const overlayId = brushState.layer?.id ?? state.previewMaskId;
+  if (overlayId) {
+    const mask = state.lastMasks?.get(overlayId);
+    if (mask) {
+      const stamp =
+        mask._rev != null
+          ? `${overlayId}|${mask.w}x${mask.h}|r${mask._rev}`
+          : `${overlayId}|${mask.w}x${mask.h}|${mask.data.length}`;
+      const dataRef = mask.data;
+      if (
+        !quickMask ||
+        quickMask.width !== mask.w ||
+        quickMask.height !== mask.h ||
+        maskOverlayStamp !== stamp ||
+        (mask._rev == null && maskOverlayData !== dataRef)
+      ) {
+        if (!quickMask || quickMask.width !== mask.w || quickMask.height !== mask.h) {
+          quickMask = document.createElement("canvas");
+          quickMask.width = mask.w;
+          quickMask.height = mask.h;
         }
-        g.drawImage(quickMask, x, y, w, h);
+        maskOverlayStamp = stamp;
+        maskOverlayData = dataRef;
+        const qc = quickMask.getContext("2d");
+        // Reuse ImageData backing store across rebuilds of the same size.
+        if (!quickMaskImg || quickMaskImg.width !== mask.w || quickMaskImg.height !== mask.h) {
+          quickMaskImg = qc.createImageData(mask.w, mask.h);
+        }
+        const px = quickMaskImg.data;
+        const md = mask.data;
+        for (let i = 0, n = md.length; i < n; i++) {
+          const o = i * 4;
+          const v = md[i];
+          px[o] = 255;
+          px[o + 1] = 40;
+          px[o + 2] = 70;
+          px[o + 3] = v * 160;
+        }
+        qc.putImageData(quickMaskImg, 0, 0);
       }
-      g.strokeStyle = "rgba(255,255,255,0.85)";
-      g.lineWidth = 1;
-      g.strokeRect(x, y, w, h);
+      stageCtx.drawImage(quickMask, x, y, w, h);
     }
-  };
-}, holder);
+    stageCtx.strokeStyle = "rgba(255,255,255,0.85)";
+    stageCtx.lineWidth = 1;
+    stageCtx.strokeRect(x, y, w, h);
+  }
+}
 
-document.addEventListener("glitchinarium:mask-preview", () => sketch?.redraw());
+// Match holder after layout settles (first paint can be 0×0 without absolute fill).
+queueMicrotask(fitStage);
 
-let quickMask = null;
-let quickMaskImg = null;
-/** Stamp / data ref for last baked overlay — avoids full float→RGBA each frame. */
-let maskOverlayStamp = "";
-let maskOverlayData = null;
+document.addEventListener("glitchinarium:mask-preview", () => paintStage());
 
 // Observe the stage (not only the holder) so flex/grid reflows always refit.
 const stageResize = new ResizeObserver(() => fitStage());
@@ -361,7 +355,7 @@ async function renderPreview(seq) {
   if (!paintFast && result.buf) {
     state.previewCanvas = bufToCanvas(result.buf, state.previewCanvas ?? undefined);
   }
-  sketch?.redraw();
+  paintStage();
 
   const active = state.layers.filter((l) => l.enabled).length;
   const backend = renderClient.supported ? "worker" : "main";
@@ -585,11 +579,11 @@ for (const node of [dropzone, stage]) {
 /** Canvas client coords → normalised 0..1 image coords, or null if outside. */
 function stageToImage(clientX, clientY) {
   const vp = state.viewport;
-  if (!vp || !sketch) return null;
-  const rect = sketch.canvas.getBoundingClientRect();
-  // The p5 canvas is laid out in CSS pixels but sized in sketch units.
-  const sx = ((clientX - rect.left) / rect.width) * sketch.width;
-  const sy = ((clientY - rect.top) / rect.height) * sketch.height;
+  if (!vp) return null;
+  const rect = stageCanvas.getBoundingClientRect();
+  // Layout is CSS pixels; buffer width/height match those units (no DPR scaling).
+  const sx = ((clientX - rect.left) / rect.width) * stageW;
+  const sy = ((clientY - rect.top) / rect.height) * stageH;
   const nx = (sx - vp.x) / vp.w;
   const ny = (sy - vp.y) / vp.h;
   if (nx < 0 || ny < 0 || nx > 1 || ny > 1) return null;
@@ -600,7 +594,7 @@ attachBrush(stage, stageToImage);
 
 onBrushChange(() => {
   stage.classList.toggle("is-painting", !!brushState.layer);
-  sketch?.redraw();
+  paintStage();
 });
 
 // ---------------------------------------------------------------- globals

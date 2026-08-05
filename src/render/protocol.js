@@ -1,6 +1,6 @@
 /**
  * Shared message shapes for main ↔ render worker.
- * Keep this free of DOM / p5 so both sides can import it.
+ * Keep this free of DOM so both sides can import it.
  */
 
 export const MSG = {
