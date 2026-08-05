@@ -6,8 +6,13 @@ intermingle-able processors, exportable at 1×/2×/4×.
 ```sh
 bun install
 bun dev        # http://localhost:3000
+bun build      # static site → dist/ (what GitHub Pages deploys)
 bun verify     # headless engine checks + sample renders into out/
 ```
+
+Pushes to `main` build `dist/` and deploy to **GitHub Pages**
+(`https://colinstark.github.io/glitchinarium/`). One-time setup: repo
+**Settings → Pages → Source: GitHub Actions**.
 
 ## How it works
 

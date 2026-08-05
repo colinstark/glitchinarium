@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "bun --hot index.html",
+    "build": "bun scripts/build.js",
     "verify": "bun verify.js"
   },
   "dependencies": {
