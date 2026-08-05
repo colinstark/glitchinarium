@@ -88,7 +88,8 @@ export function bufFromDrawable(src, w, h) {
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
   ctx.drawImage(src, 0, 0, w, h);
-  return bufFromImageData(ctx.getImageData(0, 0, w, h));
+  // The scratch canvas is discarded here, so the ImageData is ours to keep.
+  return bufFromOwnedImageData(ctx.getImageData(0, 0, w, h));
 }
 
 /** Pack a Buf into a transferable ArrayBuffer message payload. */
