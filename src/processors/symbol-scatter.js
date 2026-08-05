@@ -1,4 +1,4 @@
-import { bufFromImageData } from "../buffer.js";
+import { bufFromOwnedImageData } from "../buffer.js";
 import { luma, buildRamp, PALETTES, PALETTE_NAMES } from "../color.js";
 import { jitteredPoints, pointRandom, noise2, curlAngle } from "../rng.js";
 
@@ -142,6 +142,6 @@ export default {
       }
     }
 
-    return bufFromImageData(g.getImageData(0, 0, canvas.width, canvas.height));
+    return bufFromOwnedImageData(g.getImageData(0, 0, canvas.width, canvas.height));
   },
 };

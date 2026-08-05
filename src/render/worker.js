@@ -162,6 +162,9 @@ self.onmessage = async (ev) => {
 
       case MSG.LOAD_FONTS: {
         await loadFonts(msg.fonts ?? []);
+        // Glyph layers measure text, so anything already rendered was laid out
+        // against fallback metrics — tell main to re-render.
+        self.postMessage({ type: MSG.FONTS_OK });
         break;
       }
 

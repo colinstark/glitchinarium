@@ -50,7 +50,7 @@ export default {
     // box filter cannot express — blur at the widest requested radius, then
     // scale the contribution per pixel. Visually equivalent for a bloom.
     const radiusMod = ctx.modPx("radius", p.radius);
-    boxBlurBuf(bright, Math.max(1, radiusMod.max));
+    boxBlurBuf(bright, Math.max(1, radiusMod.max), undefined, ctx);
 
     const out = cloneBuf(src);
     const d = out.data;

@@ -1,4 +1,4 @@
-import { bufFromImageData, regionAverage } from "../buffer.js";
+import { bufFromOwnedImageData, regionAverage } from "../buffer.js";
 import { luma, buildRamp, PALETTES, PALETTE_NAMES, parseHex } from "../color.js";
 import { curlAngle, noise2 } from "../rng.js";
 import { phyllotaxisPoints } from "../geometry.js";
@@ -226,6 +226,6 @@ export default {
       });
     }
 
-    return bufFromImageData(g.getImageData(0, 0, canvas.width, canvas.height));
+    return bufFromOwnedImageData(g.getImageData(0, 0, canvas.width, canvas.height));
   },
 };

@@ -8,6 +8,7 @@ export const MSG = {
   INIT_OK: "init-ok",
   INIT_ERR: "init-err",
   LOAD_FONTS: "load-fonts",
+  FONTS_OK: "fonts-ok",
   RENDER: "render",
   PROGRESS: "progress",
   RESULT: "result",

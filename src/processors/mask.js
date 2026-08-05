@@ -183,7 +183,11 @@ function saliencyField(src, field, centerBias) {
  * a mask painted while looking at a 900px preview lands in exactly the same
  * place on a 6000px export.
  */
-function expandFieldBBox(field, x0, y0, x1, y1) {
+function expandFieldBBox(field, x0, y0, x1, y1, erase) {
+  // A union-only box can only grow, so an erase — which can shrink the painted
+  // region, or empty it — leaves it a superset. Still correct to composite
+  // through, just looser; flag it so fieldBBox pays for an exact rescan.
+  if (erase) field._looseBBox = true;
   const b = field._bbox || { x0: Infinity, y0: Infinity, x1: -1, y1: -1 };
   if (x0 < b.x0) b.x0 = x0;
   if (y0 < b.y0) b.y0 = y0;
@@ -224,7 +228,7 @@ function rasterStroke(ctx, field, w, h, stroke, start = 0) {
       const bx = Math.min(w - 1, Math.ceil(px + r));
       const ay = Math.max(0, Math.floor(py - r));
       const by = Math.min(h - 1, Math.ceil(py + r));
-      expandFieldBBox(field, ax, ay, bx, by);
+      expandFieldBBox(field, ax, ay, bx, by, erase);
 
       for (let y = ay; y <= by; y++) {
         const dy = y - py;
@@ -323,6 +327,7 @@ function cachedPaintField(ctx, w, h, strokes) {
   if (!incremental && !noChange) {
     entry.field.fill(0);
     entry.field._bbox = null;
+    entry.field._looseBBox = false;
     paintField(ctx, entry.field, w, h, strokes);
   }
   entry.strokes = snapshotStrokes(strokes);
@@ -332,7 +337,7 @@ function cachedPaintField(ctx, w, h, strokes) {
 
 /** Tight bbox of non-zero samples; null if empty or essentially full-frame. */
 function fieldBBox(field, w, h) {
-  if (field._bbox && field._bbox.x1 >= field._bbox.x0) {
+  if (field._bbox && !field._looseBBox && field._bbox.x1 >= field._bbox.x0) {
     const b = field._bbox;
     return {
       x0: Math.max(0, b.x0 | 0),
@@ -768,8 +773,6 @@ export default {
         };
       }
       mask.bbox = bbox;
-      // Overlay / cache stamp — avoids rebuilding pink overlay on identical revs.
-      mask._rev = p.strokes?._v ?? 0;
     }
 
     // Return pooled scratch now that mask.data owns the final values.

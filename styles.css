@@ -1603,6 +1603,11 @@ summary:focus-visible,
   font-variant-numeric: tabular-nums;
 }
 
+.overlay-cancel {
+  margin-top: 0.75rem;
+  align-self: center;
+}
+
 /* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
   *,

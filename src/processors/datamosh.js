@@ -35,29 +35,59 @@ const QUANT = [
   49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99,
 ];
 
+/**
+ * Scratch for dctQuantIdct. Module-level is safe: the transform is synchronous
+ * and never re-entered, and a small block size schedules hundreds of thousands
+ * of calls per export — allocating two 64-float arrays inside each one was
+ * millions of allocations.
+ */
+const _dctTmp = new Float32Array(64);
+const _dctFreq = new Float32Array(64);
+
+/**
+ * Forward DCT → quantise → inverse, in place on an 8x8 block.
+ *
+ * Done separably (rows, then columns). The direct 2-D form is O(n⁴) per pass —
+ * ~8k multiplies a block, which at a fine block size turns an export into
+ * minutes of frozen tab. Four 8x8x8 passes is ~4x cheaper and identical output.
+ */
 function dctQuantIdct(block, qScale) {
-  const freq = new Float32Array(64);
-  for (let u = 0; u < 8; u++) {
+  const tmp = _dctTmp;
+  const freq = _dctFreq;
+
+  // Forward, y → v (rows of the [x][y] layout), then x → u.
+  for (let x = 0; x < 8; x++) {
+    const row = x * 8;
     for (let v = 0; v < 8; v++) {
       let sum = 0;
-      for (let x = 0; x < 8; x++) {
-        for (let y = 0; y < 8; y++) {
-          sum += block[x * 8 + y] * COS[x * 8 + u] * COS[y * 8 + v];
-        }
-      }
-      const q = QUANT[u * 8 + v] * qScale;
-      const coef = 0.25 * C[u] * C[v] * sum;
-      freq[u * 8 + v] = Math.round(coef / q) * q;
+      for (let y = 0; y < 8; y++) sum += block[row + y] * COS[y * 8 + v];
+      tmp[row + v] = sum;
     }
   }
-  for (let x = 0; x < 8; x++) {
+  for (let v = 0; v < 8; v++) {
+    for (let u = 0; u < 8; u++) {
+      let sum = 0;
+      for (let x = 0; x < 8; x++) sum += tmp[x * 8 + v] * COS[x * 8 + u];
+      const q = QUANT[u * 8 + v] * qScale;
+      const coef = 0.25 * C[u] * C[v] * sum;
+      // Fold C[u]*C[v] back in here so the inverse passes stay bare sums.
+      freq[u * 8 + v] = Math.round(coef / q) * q * C[u] * C[v];
+    }
+  }
+
+  // Inverse, v → y then u → x.
+  for (let u = 0; u < 8; u++) {
+    const row = u * 8;
     for (let y = 0; y < 8; y++) {
       let sum = 0;
-      for (let u = 0; u < 8; u++) {
-        for (let v = 0; v < 8; v++) {
-          sum += C[u] * C[v] * freq[u * 8 + v] * COS[x * 8 + u] * COS[y * 8 + v];
-        }
-      }
+      for (let v = 0; v < 8; v++) sum += freq[row + v] * COS[y * 8 + v];
+      tmp[row + y] = sum;
+    }
+  }
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++) {
+      let sum = 0;
+      for (let u = 0; u < 8; u++) sum += tmp[u * 8 + y] * COS[x * 8 + u];
       block[x * 8 + y] = 0.25 * sum;
     }
   }
@@ -96,6 +126,8 @@ export default {
     const dirX = Math.cos(p.angle);
     const dirY = Math.sin(p.angle);
     const px = new Float32Array(4);
+    // Hoisted: dct mode refills this for every block and channel.
+    const cell = new Float32Array(64);
 
     const markBlock = (bx, by, v) => {
       if (!mask) return;
@@ -160,7 +192,6 @@ export default {
         if (p.mode === "dct") {
           const strength = 1 + (1 - p.quality) * 40 * (0.4 + n * amount);
           for (let c = 0; c < 3; c++) {
-            const cell = new Float32Array(64);
             const cw = (x1 - x0) / 8;
             const ch = (y1 - y0) / 8;
             for (let u = 0; u < 8; u++) {

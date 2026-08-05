@@ -68,17 +68,45 @@ export function createLayer(type, overrides = {}) {
 }
 
 /**
- * Last layer the UI marked dirty — used for worker sticky param patches so
- * slider previews do not re-clone the whole stack DTO every frame.
+ * Layers the UI has marked dirty since the last render dispatch — used for
+ * worker sticky param patches so slider previews do not re-clone the whole
+ * stack DTO every frame.
+ *
+ * It is a SET, not a single id: a patch only describes one layer, so it is only
+ * a safe substitute for the full DTO when exactly one layer changed. Two edits
+ * landing inside one debounce window would otherwise leave the worker's sticky
+ * stack holding stale values for the layer we did not describe.
  */
-export let liveEditLayerId = null;
+const dirtyLayerIds = new Set();
 
 /**
  * Hint that a layer's params changed. Fingerprint still rebuilds from live
  * params; we also record which layer was edited for live IPC patches.
  */
 export function touchLayerKey(layer) {
-  if (layer?.id) liveEditLayerId = layer.id;
+  if (layer?.id) dirtyLayerIds.add(layer.id);
+}
+
+/** The one dirty layer id, or null when zero — or several — layers changed. */
+export function soleDirtyLayerId() {
+  return dirtyLayerIds.size === 1 ? dirtyLayerIds.values().next().value : null;
+}
+
+/** Call once a render carrying these edits has been dispatched. */
+export function clearDirtyLayers() {
+  dirtyLayerIds.clear();
+}
+
+/**
+ * Identity of a stack as the render worker sees it: which layers, of what type,
+ * in what order. A live patch may only be sent when this still matches what the
+ * worker was last given in full — otherwise adding, deleting or reordering a
+ * layer would leave the worker replaying its stale sticky DTO.
+ */
+export function stackSignature(layers) {
+  let sig = "";
+  for (const l of layers) sig += `${l.id}:${l.type};`;
+  return sig;
 }
 
 /**
@@ -132,6 +160,22 @@ function layerKey(layer) {
   ]);
 }
 
+/**
+ * Stamp a freshly computed mask with a content revision.
+ *
+ * The worker skips re-transferring a mask whose stamp is unchanged, so the
+ * stamp has to track content. Deriving one from the buffer's shape cannot —
+ * every luma mask of a given size looks identical that way, and the overlay
+ * would freeze on its first value. A monotonic counter is exact for what we
+ * need: a mask restored from a cache snapshot keeps its old number (it really
+ * is the same field), and anything recomputed gets a new one.
+ */
+let maskRev = 0;
+function stampMask(mask) {
+  if (mask && mask._rev == null) mask._rev = ++maskRev;
+  return mask;
+}
+
 /** True when every pixel of `buf` is fully opaque (alpha 255). */
 function isFullyOpaque(buf) {
   const d = buf.data;
@@ -171,7 +215,13 @@ function resolveMask(ctx, layer, derivedCache) {
       m.data.set(base.data);
     }
     blurMask(m, featherPx);
-    if (base.bbox) m.bbox = expandBBox(base.bbox, Math.ceil(featherPx) + 1, base.w, base.h);
+    // The bbox marks where a sparse mask is non-zero, so compositeInto can skip
+    // the rest. Once the inversion is baked into the data the field is DENSE
+    // outside that box — carrying the bbox over would clip the layer to the one
+    // region the inverted mask zeroes out, i.e. apply it nowhere.
+    if (base.bbox && !layer.maskInvert) {
+      m.bbox = expandBBox(base.bbox, Math.ceil(featherPx) + 1, base.w, base.h);
+    }
   } else if (layer.maskInvert) {
     // Zero-copy invert view — compositeInto honors `.invert`.
     m = { w: base.w, h: base.h, data: base.data, invert: true, bbox: base.bbox ?? null };
@@ -210,6 +260,14 @@ export function* renderSteps(layers, source, ctx, cache = null, opts = {}) {
   let acc = null;
 
   if (cache) {
+    // layerKey covers the stack; it cannot see the seed or the render size, and
+    // both change what every layer produces. Salt the whole cache with them so
+    // its validity does not depend on callers remembering to invalidate.
+    const salt = `${ctx.seed}|${ctx.w}x${ctx.h}`;
+    if (cache._salt !== salt) {
+      cache.length = 0;
+      cache._salt = salt;
+    }
     let i = 0;
     while (i < cache.length && i < keys.length && cache[i].key === keys[i]) i++;
     cache.length = i;
@@ -244,27 +302,31 @@ export function* renderSteps(layers, source, ctx, cache = null, opts = {}) {
       if (proc) {
         ctx.forLayer(i, layer);
         if (proc.kind === "mask") {
-          ctx.masks.set(layer.id, proc.compute(ctx, acc, layer.params));
+          ctx.masks.set(layer.id, stampMask(proc.compute(ctx, acc, layer.params)));
         } else {
           const out = proc.apply(ctx, acc, layer.params);
+          // Processors like datamosh publish a mask as a side effect of apply().
+          stampMask(ctx.masks.get(layer.id));
           if (out) {
             const mask = resolveMask(ctx, layer, derivedCache);
             const opacity = layer.opacity ?? 1;
             const blend = layer.blend ?? "normal";
             // Full replace: skip a whole-frame composite when the layer is a
             // straight opaque overwrite (common for warps / tone / glitch).
-            if (
+            const canReplace =
               !mask &&
               opacity >= 1 &&
               blend === "normal" &&
               out !== acc &&
               out.w === acc.w &&
-              out.h === acc.h &&
-              isFullyOpaque(out)
-            ) {
+              out.h === acc.h;
+            // Only worth an alpha scan when a full replace is actually on the
+            // table; hand the answer to compositeInto so it does not rescan.
+            const srcOpaque = canReplace ? isFullyOpaque(out) : null;
+            if (canReplace && srcOpaque) {
               acc = out;
             } else if (out !== acc) {
-              compositeInto(acc, out, { mode: blend, opacity, mask });
+              compositeInto(acc, out, { mode: blend, opacity, mask, srcOpaque });
             }
             // out === acc: processor mutated in place — nothing to do.
           }

@@ -1,4 +1,4 @@
-import { bufFromImageData } from "../buffer.js";
+import { bufFromOwnedImageData } from "../buffer.js";
 import { luma, buildRamp, PALETTES, PALETTE_NAMES, parseHex } from "../color.js";
 import { CHARSETS } from "./ascii.js";
 
@@ -130,6 +130,6 @@ export default {
       }
     }
 
-    return bufFromImageData(g.getImageData(0, 0, canvas.width, canvas.height));
+    return bufFromOwnedImageData(g.getImageData(0, 0, canvas.width, canvas.height));
   },
 };

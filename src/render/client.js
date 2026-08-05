@@ -74,14 +74,21 @@ function candidateWorkerUrls() {
   });
 }
 
+/**
+ * Pull the woff2 bytes behind our Google Fonts <link>s so the worker can
+ * register the same faces (workers cannot inherit the document's font set).
+ *
+ * A css2 sheet emits one @font-face per family AND per unicode subset, so this
+ * is routinely dozens of files. They are fetched in parallel, and the caller
+ * must not put this on the worker's boot path — see makeWorkerClient.
+ */
 async function collectGoogleFontBuffers() {
   if (typeof document === "undefined") return [];
   const sheets = [...document.querySelectorAll('link[rel="stylesheet"]')]
     .map((l) => l.href)
     .filter((h) => /fonts\.googleapis\.com/i.test(h));
-  const fonts = [];
-  const seen = new Set();
 
+  const wanted = new Map(); // url → family
   for (const href of sheets) {
     try {
       const css = await fetch(href).then((r) => r.text());
@@ -92,21 +99,42 @@ async function collectGoogleFontBuffers() {
         const family = m[1].trim();
         let url = m[2].trim().replace(/^['"]|['"]$/g, "");
         if (url.startsWith("//")) url = `https:${url}`;
-        const key = `${family}|${url}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        try {
-          const buffer = await fetch(url).then((r) => r.arrayBuffer());
-          fonts.push({ family, buffer });
-        } catch {
-          /* optional */
-        }
+        if (!wanted.has(url)) wanted.set(url, family);
       }
     } catch {
       /* optional */
     }
   }
-  return fonts;
+
+  const fonts = await Promise.all(
+    [...wanted].map(async ([url, family]) => {
+      try {
+        return { family, buffer: await fetch(url).then((r) => r.arrayBuffer()) };
+      } catch {
+        return null;
+      }
+    })
+  );
+  return fonts.filter(Boolean);
+}
+
+/**
+ * Fired once the worker has registered its webfonts. Glyph layers measure text,
+ * so anything rendered before this used fallback metrics and must be redrawn.
+ */
+const fontListeners = new Set();
+export function onRenderFontsLoaded(fn) {
+  fontListeners.add(fn);
+  return () => fontListeners.delete(fn);
+}
+function notifyFontsLoaded() {
+  for (const fn of fontListeners) {
+    try {
+      fn();
+    } catch {
+      /* a listener must not take down the render client */
+    }
+  }
 }
 
 /** @returns {Promise<{url: URL | string, text: string} | null>} */
@@ -305,6 +333,10 @@ function makeWorkerClient(workerUrl, opts = {}) {
       kill(new Error(msg.message || "worker init failed"));
       return;
     }
+    if (msg.type === MSG.FONTS_OK) {
+      notifyFontsLoaded();
+      return;
+    }
 
     const slot = pending.get(msg.id);
     if (!slot) return;
@@ -375,27 +407,37 @@ function makeWorkerClient(workerUrl, opts = {}) {
   };
   worker.onmessageerror = () => kill(new Error("render worker messageerror"));
 
-  collectGoogleFontBuffers()
-    .then((fonts) => {
-      if (dead) return;
-      try {
-        worker.postMessage({ type: MSG.INIT, fonts }, fonts.map((f) => f.buffer));
-      } catch (err) {
-        kill(err);
-      }
-    })
-    .catch(() => {
-      if (dead) return;
-      try {
-        worker.postMessage({ type: MSG.INIT, fonts: [] });
-      } catch (err) {
-        kill(err);
-      }
-    });
+  // Boot immediately. Fonts used to be fetched BEFORE this, inside the same
+  // 4s budget — dozens of serial CDN round-trips racing a hard timeout, and
+  // losing that race silently demoted the whole session to the main thread.
+  try {
+    worker.postMessage({ type: MSG.INIT, fonts: [] });
+  } catch (err) {
+    kill(err);
+    return null;
+  }
 
   setTimeout(() => {
     if (!readySettled) kill(new Error("render worker init timeout"));
   }, 4000);
+
+  // Fonts follow out-of-band; the worker announces FONTS_OK and the app
+  // re-renders, so the first frame is at worst laid out on fallback metrics.
+  collectGoogleFontBuffers()
+    .then((fonts) => {
+      if (dead || !fonts.length) return;
+      try {
+        worker.postMessage(
+          { type: MSG.LOAD_FONTS, fonts },
+          fonts.map((f) => f.buffer)
+        );
+      } catch {
+        /* fonts are optional — never kill a working worker over them */
+      }
+    })
+    .catch(() => {
+      /* fonts are optional */
+    });
 
   return {
     supported: true,

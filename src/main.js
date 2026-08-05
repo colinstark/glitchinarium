@@ -15,12 +15,13 @@ import {
   installRenderWorker,
   paintLayerPatch,
   layerLivePatch,
+  onRenderFontsLoaded,
 } from "./render/client.js";
 import { createLayerStack } from "./ui/layers.js";
 import { pickFile } from "./ui/controls.js";
 import { brushState, attachBrush, onBrushChange, endPaint } from "./ui/brush.js";
 import { randomizeParams, randomizeStack, SCOPES } from "./ui/randomize.js";
-import { liveEditLayerId } from "./pipeline.js";
+import { soleDirtyLayerId, clearDirtyLayers, stackSignature } from "./pipeline.js";
 import {
   BUILTIN,
   instantiate,
@@ -49,8 +50,11 @@ const state = {
   cacheKey: "",
   /** True when the worker already holds the buffer for `cacheKey`. */
   workerHasSource: false,
-  /** True when the worker holds a sticky layer DTO for paint patches. */
-  workerHasLayers: false,
+  /**
+   * Signature of the stack the worker last received IN FULL, or null. Layer
+   * patches are only valid while this still matches the live stack.
+   */
+  workerLayerSig: null,
   rendering: false,
   /** Where the preview was letterboxed on the canvas — the brush needs it. */
   viewport: null,
@@ -199,6 +203,14 @@ queueMicrotask(fitStage);
 
 document.addEventListener("glitchinarium:mask-preview", () => paintStage());
 
+// The worker registers its webfonts after boot rather than blocking on them.
+// Glyph layers measure text, so whatever it rendered first used fallback
+// metrics — drop the layer cache and redraw once the real faces land.
+onRenderFontsLoaded(() => {
+  invalidateCache();
+  if (state.image) scheduleRender();
+});
+
 // Observe the stage (not only the holder) so flex/grid reflows always refit.
 const stageResize = new ResizeObserver(() => fitStage());
 stageResize.observe(stage);
@@ -267,6 +279,10 @@ function previewMaxEdge(painting) {
 
 const renderClient = getRenderClient();
 
+/** Retries when a still-current preview returns null (unexpected abort). */
+let previewRetries = 0;
+let previewRetryForSeq = 0;
+
 function enqueuePreview() {
   const seq = ++previewSeq;
   // Abort in-flight work — only the latest seq is allowed to paint the stage.
@@ -276,6 +292,12 @@ function enqueuePreview() {
     const msg = String(err?.message || err);
     if (/worker/i.test(msg)) {
       setStatus("Preview using main thread");
+      // Worker path failed open — force a main-thread retry with a full payload.
+      if (seq === previewSeq && state.image) {
+        state.workerLayerSig = null;
+        state.workerHasSource = false;
+        scheduleRender();
+      }
       return;
     }
     setStatus(`Preview failed: ${msg}`);
@@ -341,7 +363,7 @@ document.addEventListener("glitchinarium:scrub", (e) => {
  */
 function invalidateCache({ clearSource = false, clearLayers = true } = {}) {
   if (clearSource) state.workerHasSource = false;
-  if (clearLayers) state.workerHasLayers = false;
+  if (clearLayers) state.workerLayerSig = null;
   renderClient.invalidateCache({ clearSource, clearLayers });
 }
 
@@ -364,11 +386,21 @@ function mergeMasks(result) {
 
 /** Apply a preview result buffer or ImageBitmap onto state.previewCanvas. */
 function applyPreviewPixels(result) {
-  if (result.paintOnly) return;
+  if (!result || result.paintOnly) return false;
   if (result.bitmap) {
     const bmp = result.bitmap;
     const w = bmp.width;
     const h = bmp.height;
+    if (!w || !h) {
+      if (typeof bmp.close === "function") {
+        try {
+          bmp.close();
+        } catch {
+          /* ignore */
+        }
+      }
+      return false;
+    }
     if (!state.previewCanvas || state.previewCanvas.width !== w || state.previewCanvas.height !== h) {
       state.previewCanvas = document.createElement("canvas");
       state.previewCanvas.width = w;
@@ -384,10 +416,38 @@ function applyPreviewPixels(result) {
         /* ignore */
       }
     }
-    return;
+    return true;
   }
   if (result.buf) {
     state.previewCanvas = bufToCanvas(result.buf, state.previewCanvas ?? undefined);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Blit the decoded source into the stage immediately so a slow/aborted stack
+ * render cannot leave "metadata set, blank stage". Full preview overwrites this.
+ */
+function showSourcePlaceholder() {
+  if (!state.image?.drawable) return;
+  try {
+    const plan = planPreview(
+      state.image.w,
+      state.image.h,
+      previewMaxEdge(false)
+    );
+    state.previewSource = bufFromDrawable(
+      state.image.drawable,
+      plan.renderW,
+      plan.renderH
+    );
+    state.cacheKey = `${plan.renderW}x${plan.renderH}`;
+    state.workerHasSource = false;
+    state.previewCanvas = bufToCanvas(state.previewSource, state.previewCanvas ?? undefined);
+    paintStage();
+  } catch (err) {
+    console.warn("[preview] source placeholder failed:", err?.message || err);
   }
 }
 
@@ -457,21 +517,20 @@ async function renderPreview(seq) {
   }
 
   // Sticky worker layers: paint sends strokes only; sliders send one-layer patch.
-  const usePaintPatch =
-    paintFast &&
-    renderClient.supported &&
-    state.workerHasLayers &&
-    !!paintLayer;
+  //
+  // A patch rewrites ONE layer of the worker's sticky DTO, so it is only a
+  // valid substitute for the full stack while two things hold: the DTO still
+  // describes this exact stack (adding / deleting / reordering changes the
+  // signature), and exactly one layer has pending edits (a patch cannot carry
+  // the second layer's changes).
+  const stackSig = stackSignature(state.layers);
+  const workerStackFresh = renderClient.supported && state.workerLayerSig === stackSig;
 
-  const editLayer =
-    !paintFast && liveEditLayerId
-      ? state.layers.find((l) => l.id === liveEditLayerId)
-      : null;
-  const useLivePatch =
-    !usePaintPatch &&
-    !!editLayer &&
-    renderClient.supported &&
-    state.workerHasLayers;
+  const usePaintPatch = paintFast && workerStackFresh && !!paintLayer;
+
+  const dirtyId = paintFast ? null : soleDirtyLayerId();
+  const editLayer = dirtyId ? state.layers.find((l) => l.id === dirtyId) : null;
+  const useLivePatch = !usePaintPatch && !!editLayer && workerStackFresh;
 
   // Masks only when overlay/paint needs them — skip transfer while scrubbing params.
   const needMasks =
@@ -480,6 +539,11 @@ async function renderPreview(seq) {
     !!state.previewMaskId;
 
   const scrubbing = scrubActive && !painting;
+
+  // The worker folds a patch into its sticky DTO on receipt, whether or not the
+  // render that carried it completes — so once this job is posted the edits are
+  // accounted for. A full DTO covers them by definition.
+  clearDirtyLayers();
 
   const result = await renderClient.renderJob(
     {
@@ -519,18 +583,45 @@ async function renderPreview(seq) {
     }
   );
 
-  if (!result || seq !== previewSeq || state.rendering) {
+  if (seq !== previewSeq || state.rendering) {
     if (state.rendering) renderAfterExport = true;
     return;
   }
 
+  // Aborted (null) while still the active request — re-schedule a few times so
+  // a cancelled worker job cannot strand the stage with only source metadata.
+  if (!result) {
+    if (previewRetryForSeq !== seq) {
+      previewRetryForSeq = seq;
+      previewRetries = 0;
+    }
+    if (previewRetries < 2) {
+      previewRetries++;
+      scheduleRender();
+    } else {
+      setStatus("Preview interrupted — nudge a slider or reload the image");
+    }
+    return;
+  }
+
+  previewRetries = 0;
+  previewRetryForSeq = 0;
+
   if (sendSource) state.workerHasSource = true;
   // Full DTO landed on the worker (or local). Patches keep sticky.
-  if (!usePaintPatch && !useLivePatch) state.workerHasLayers = renderClient.supported;
+  // The paint fast-path sends only a PREFIX of the stack, so it must not leave
+  // the worker's DTO marked authoritative — the layers above would be lost.
+  if (!usePaintPatch && !useLivePatch) {
+    state.workerLayerSig = renderClient.supported && !paintFast ? stackSig : null;
+  }
 
   const ms = performance.now() - t0;
   if (needMasks) mergeMasks(result);
-  applyPreviewPixels(result);
+  const painted = applyPreviewPixels(result);
+  if (!painted && !result.paintOnly && state.previewSource) {
+    // Missing bitmap/buffer — keep the stage honest with the decoded source.
+    state.previewCanvas = bufToCanvas(state.previewSource, state.previewCanvas ?? undefined);
+  }
   paintStage();
 
   const active = state.layers.filter((l) => l.enabled).length;
@@ -685,12 +776,18 @@ async function loadImageFile(file) {
     $("stage").classList.add("has-image");
     $("export-btn").disabled = false;
     state.cacheKey = "";
-    state.workerHasLayers = false;
-    invalidateCache({ clearSource: true });
-    // Supersede any in-flight preview that was still using the old source.
-    previewSeq++;
+    state.workerHasSource = false;
+    state.workerLayerSig = null;
+    state.lastMasks = null;
+    invalidateCache({ clearSource: true, clearLayers: true });
+    // Drop stale stack pixels, show source immediately, then full preview.
+    // Avoids "metadata filled in, blank stage" when the first job is aborted
+    // or delayed (worker boot, supersede race, fonts, etc.).
+    state.previewCanvas = null;
+    showSourcePlaceholder();
     updateExportMeta();
-    scheduleRender();
+    // Immediate enqueue (not debounced) — supersedes in-flight work via seq.
+    enqueuePreview();
   } catch (err) {
     if (gen !== loadGen) return;
     console.error(err);
@@ -1021,6 +1118,17 @@ if (qualityGroup) {
   });
 }
 
+/** Set by the overlay's Cancel button; read by the export's shouldAbort. */
+let exportCancelled = false;
+
+const overlayCancel = $("overlay-cancel");
+overlayCancel?.addEventListener("click", () => {
+  if (!state.rendering) return;
+  exportCancelled = true;
+  overlayCancel.disabled = true;
+  $("overlay-title").textContent = "Cancelling…";
+});
+
 exportBtn.addEventListener("click", async () => {
   if (!state.image || state.rendering) return;
   // Snapshot job inputs so a later stack edit cannot mutate the in-flight export.
@@ -1038,11 +1146,13 @@ exportBtn.addEventListener("click", async () => {
   };
 
   state.rendering = true;
+  exportCancelled = false;
   // Cancel any in-flight preview so it does not touch the cache mid-export.
   previewSeq++;
   exportBtn.disabled = true;
   const overlay = $("overlay");
   const fill = $("overlay-fill");
+  if (overlayCancel) overlayCancel.disabled = false;
   overlay.hidden = false;
 
   try {
@@ -1056,7 +1166,7 @@ exportBtn.addEventListener("click", async () => {
       format: job.format,
       exportQuality: job.exportQuality,
       quality: job.format === "jpg" ? 0.92 : 0.95,
-      shouldAbort: () => false,
+      shouldAbort: () => exportCancelled,
       onProgress: ({ phase, done, total, layer, plan }) => {
         fill.style.transform = `scaleX(${total ? done / total : 0})`;
         const titles = {

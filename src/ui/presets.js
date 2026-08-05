@@ -13,6 +13,42 @@ import { PROCESSORS } from "../processors/index.js";
 const STORE_KEY = "glitchinarium.presets.v1";
 
 /**
+ * Brush strokes are the one param type with no schema to clamp against, and
+ * rasterising them is O(points x brush area) — so an imported preset gets both
+ * its numbers coerced and its size capped. Generous next to any real painting;
+ * the point is that a hand-edited file cannot schedule unbounded work.
+ */
+const MAX_STROKES = 512;
+const MAX_STROKE_POINTS = 20000; // 10k xy pairs
+
+function coerceStrokes(value) {
+  if (!Array.isArray(value)) return [];
+  const num = (v, lo, hi, fallback) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : fallback;
+  };
+  const out = [];
+  for (const stroke of value.slice(0, MAX_STROKES)) {
+    if (!stroke || typeof stroke !== "object" || !Array.isArray(stroke.pts)) continue;
+    const pts = [];
+    const end = Math.min(stroke.pts.length, MAX_STROKE_POINTS);
+    for (let i = 0; i + 1 < end; i += 2) {
+      pts.push(num(stroke.pts[i], 0, 1, 0), num(stroke.pts[i + 1], 0, 1, 0));
+    }
+    // A stroke needs two points to have a segment to stamp along.
+    if (pts.length < 4) continue;
+    out.push({
+      pts,
+      r: num(stroke.r, 1, 400, 20),
+      hardness: num(stroke.hardness, 0, 1, 0.5),
+      flow: num(stroke.flow, 0.01, 1, 1),
+      erase: !!stroke.erase,
+    });
+  }
+  return out;
+}
+
+/**
  * Coerce a raw preset param value through the processor schema so bad JSON
  * cannot inject unknown keys or NaN coordinates that crash the control panel.
  */
@@ -52,7 +88,7 @@ function coerceParam(def, value) {
       return structuredClone(def.default);
     }
     case "paint":
-      return Array.isArray(value) ? value : [];
+      return coerceStrokes(value);
     default:
       return value === undefined ? structuredClone(def.default) : value;
   }

@@ -1,4 +1,4 @@
-import { bufFromImageData, createMask, blurMask } from "../buffer.js";
+import { bufFromOwnedImageData, createMask, blurMask } from "../buffer.js";
 import { luma, parseHex } from "../color.js";
 
 /**
@@ -140,6 +140,6 @@ export default {
       }
     }
 
-    return bufFromImageData(g.getImageData(0, 0, canvas.width, canvas.height));
+    return bufFromOwnedImageData(g.getImageData(0, 0, canvas.width, canvas.height));
   },
 };

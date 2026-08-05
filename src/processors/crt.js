@@ -64,7 +64,7 @@ export default {
     const bleedPx = ctx.u(p.bleed);
     if (bleedPx >= 1) {
       base = base === src ? cloneBuf(src) : base;
-      boxBlurBuf(base, bleedPx, 0);
+      boxBlurBuf(base, bleedPx, 0, ctx);
     }
 
     // --- scanlines, grille, vignette ---------------------------------------

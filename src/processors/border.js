@@ -1,4 +1,4 @@
-import { bufFromImageData } from "../buffer.js";
+import { bufFromOwnedImageData } from "../buffer.js";
 import { parseHex } from "../color.js";
 import { bayerAt, checkerAt } from "../patterns.js";
 
@@ -150,6 +150,6 @@ export default {
       }
     }
 
-    return bufFromImageData(g.getImageData(0, 0, canvas.width, canvas.height));
+    return bufFromOwnedImageData(g.getImageData(0, 0, canvas.width, canvas.height));
   },
 };

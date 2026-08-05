@@ -30,6 +30,18 @@ export function bufFromImageData(imgData) {
   };
 }
 
+/**
+ * Wrap an ImageData we exclusively own — no copy.
+ *
+ * getImageData already returns a fresh, unaliased buffer, so the glyph
+ * processors would otherwise pay a second full-frame allocation and memcpy on
+ * their way out (~90 MB each at a capped export). Use bufFromImageData instead
+ * whenever the caller keeps using the ImageData afterwards.
+ */
+export function bufFromOwnedImageData(imgData) {
+  return { w: imgData.width, h: imgData.height, data: imgData.data };
+}
+
 export function bufToImageData(buf) {
   // Share the underlying buffer — no intermediate clone. Callers that will
   // mutate `buf` after painting to a canvas should clone first.
@@ -300,8 +312,14 @@ function blendChannel(mode, b, s) {
  * Mask may set `invert: true` for a zero-copy inverted view, and optional
  * `bbox: {x0,y0,x1,y1}` to skip empty regions (paint masks).
  * `src` alpha is respected so glyph layers can draw on transparency.
+ * `srcOpaque` (optional) short-circuits the whole-frame alpha scan below when
+ * the caller has already established the answer — see pipeline.renderSteps.
  */
-export function compositeInto(dst, src, { mode = "normal", opacity = 1, mask = null } = {}) {
+export function compositeInto(
+  dst,
+  src,
+  { mode = "normal", opacity = 1, mask = null, srcOpaque = null } = {}
+) {
   const d = dst.data;
   const s = src.data;
   const w = dst.w;
@@ -325,11 +343,14 @@ export function compositeInto(dst, src, { mode = "normal", opacity = 1, mask = n
 
   // Fast path: full-frame opaque normal replace (no mask, full opacity).
   if (plain && opacity >= 1 && !maskData && x0 === 0 && y0 === 0 && x1 === w - 1 && y1 === h - 1) {
-    let opaque = true;
-    for (let i = 3; i < s.length; i += 4) {
-      if (s[i] < 255) {
-        opaque = false;
-        break;
+    let opaque = srcOpaque;
+    if (opaque === null) {
+      opaque = true;
+      for (let i = 3; i < s.length; i += 4) {
+        if (s[i] < 255) {
+          opaque = false;
+          break;
+        }
       }
     }
     if (opaque) {
@@ -416,22 +437,19 @@ export function fillBuf(buf, r, g, b, a = 255) {
 /**
  * Separable box blur on an RGBA buffer, radius in pixels. Two passes so it
  * approximates a gaussian; used by glow and by CRT phosphor bleed.
+ *
+ * Pass `ctx` so the full-frame scratch comes from the render context's pool:
+ * it is then reused across preview frames but released with the context, rather
+ * than pinning an export-sized Float32Array for the life of the worker.
  */
-/** Reused scratch for boxBlurBuf — avoids allocating a full-frame Float32 every glow. */
-let _blurTmp = null;
-let _blurTmpLen = 0;
-
-export function boxBlurBuf(buf, radiusX, radiusY = radiusX) {
+export function boxBlurBuf(buf, radiusX, radiusY = radiusX, ctx = null) {
   const rx = Math.max(0, Math.round(radiusX));
   const ry = Math.max(0, Math.round(radiusY));
   if (rx < 1 && ry < 1) return buf;
   const { w, h, data } = buf;
   const n = w * h * 4;
-  if (!_blurTmp || _blurTmpLen < n) {
-    _blurTmp = new Float32Array(n);
-    _blurTmpLen = n;
-  }
-  const tmp = _blurTmp;
+  const pooled = typeof ctx?.acquireF32 === "function";
+  const tmp = pooled ? ctx.acquireF32(n) : new Float32Array(n);
 
   for (let pass = 0; pass < 2; pass++) {
     if (rx >= 1) {
@@ -504,6 +522,7 @@ export function boxBlurBuf(buf, radiusX, radiusY = radiusX) {
       for (let i = 0; i < n; i++) data[i] = tmp[i];
     }
   }
+  if (pooled) ctx.releaseF32(tmp);
   return buf;
 }
 
