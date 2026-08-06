@@ -19,8 +19,9 @@ await $`bun build ${join(root, "src/main.js")} --outdir=${dist} --target=browser
 // Self-contained worker bundle next to main.js (import.meta.url resolves here).
 await $`bun build ${join(root, "src/render/worker.js")} --outfile=${join(dist, "worker.js")} --target=browser --minify`;
 
-// Also emit root worker.js so `bun --hot` can fall back to /worker.js or blob-load it.
-await cp(join(dist, "worker.js"), join(root, "worker.js"));
+// No root worker.js copy: dev serves /worker.js from scripts/dev.js (rebuilt per
+// request), and production loads it from dist/ next to index.html. A stale
+// artifact at the repo root would only be a way to run last week's worker.
 
 await cp(join(root, "styles.css"), join(dist, "styles.css"));
 

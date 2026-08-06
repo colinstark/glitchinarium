@@ -3,8 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun build ./src/render/worker.js --outfile=./worker.js --target=browser && bun --hot index.html",
-    "dev:watch-worker": "bun build ./src/render/worker.js --outfile=./worker.js --target=browser --watch",
+    "dev": "bun --hot scripts/dev.js",
     "build": "bun scripts/build.js",
     "verify": "bun verify.js"
   },

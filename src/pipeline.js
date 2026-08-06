@@ -243,6 +243,52 @@ function expandBBox(bbox, pad, w, h) {
 }
 
 /**
+ * Drop snapshot pixels until the cache fits its byte budget.
+ *
+ * An entry keeps its `key` forever — that is what proves a prefix is unchanged —
+ * and only `buf`/`masks` are evictable, so eviction can never make a resume
+ * unsafe, merely less deep.
+ *
+ * Which to drop matters. Keeping the FIRST N makes editing a late layer replay
+ * the whole stack; keeping the LAST N does exactly that to an early layer.
+ * Neither dominates, so drop whichever survivor currently sits closest to its
+ * neighbours — the one whose removal widens the worst replay gap least. The
+ * survivors end up spread across the stack, which bounds replay to roughly
+ * depth/retained layers wherever you happen to be working.
+ *
+ * @returns the retained byte total.
+ */
+function evictSnapshots(cache, bytes, budget) {
+  let total = bytes;
+  while (total > budget) {
+    const kept = [];
+    for (let i = 0; i < cache.length; i++) if (cache[i].buf) kept.push(i);
+    // One snapshot is worth keeping even if it alone exceeds the budget; the
+    // alternative is a cache that never hits.
+    if (kept.length <= 1) break;
+
+    let victim = -1;
+    let bestCost = Infinity;
+    for (let k = 0; k < kept.length; k++) {
+      const before = k > 0 ? kept[k - 1] : -1;
+      const after = k + 1 < kept.length ? kept[k + 1] : cache.length;
+      const cost = after - before;
+      // Strict `<` keeps the later of equal candidates: the layer you just
+      // touched is the one you are most likely to touch again.
+      if (cost < bestCost) {
+        bestCost = cost;
+        victim = kept[k];
+      }
+    }
+    if (victim < 0) break;
+    total -= cache[victim].buf.data.byteLength;
+    cache[victim].buf = null;
+    cache[victim].masks = null;
+  }
+  return total;
+}
+
+/**
  * Run the stack.
  *
  * `cache` (optional) is a mutable array of per-layer snapshots. When present,
@@ -252,6 +298,7 @@ function expandBBox(bbox, pad, w, h) {
  *
  * `opts.endIndex` — exclusive end (paint fast-path stops after the mask layer).
  * `opts.skipCache` — do not write snapshots (interactive paint).
+ * `opts.maxCacheBytes` — override the snapshot budget (tests).
  */
 export function* renderSteps(layers, source, ctx, cache = null, opts = {}) {
   const endIndex = Math.min(layers.length, opts.endIndex ?? layers.length);
@@ -272,23 +319,30 @@ export function* renderSteps(layers, source, ctx, cache = null, opts = {}) {
     let i = 0;
     while (i < cache.length && i < keys.length && cache[i].key === keys[i]) i++;
     cache.length = i;
-    if (i > 0 && i <= endIndex) {
-      const snap = cache[i - 1];
+    // The prefix above proves layers 0..i-1 are unchanged, so ANY entry in it is
+    // a legal resume point — walk back to the deepest one whose pixels survived
+    // eviction. Clamping to endIndex also lets a truncated run (the paint
+    // fast-path) answer straight from a snapshot instead of replaying.
+    let resume = Math.min(i, endIndex) - 1;
+    while (resume >= 0 && !cache[resume].buf) resume--;
+    if (resume >= 0) {
+      const snap = cache[resume];
       acc = cloneBuf(snap.buf);
       // New Map, same buffers as the snapshot. Snapshots already deep-copied
       // masks on store, so entries are not shared across cache slots unless
       // cloneMasks deliberately shared stable identities.
       ctx.masks = new Map(snap.masks);
-      start = i;
+      start = resume + 1;
     }
   }
 
   // Snapshots are full-frame RGBA copies. Sum what the surviving prefix already
   // costs so the budget is enforced against the real retained total, not against
   // this render's contribution alone.
+  const maxCacheBytes = opts.maxCacheBytes ?? MAX_CACHE_BYTES;
   let cachedBytes = 0;
   if (writeCache) {
-    for (const snap of cache) cachedBytes += snap.buf.data.byteLength;
+    for (const snap of cache) if (snap.buf) cachedBytes += snap.buf.data.byteLength;
   }
 
   if (!acc) {
@@ -347,13 +401,13 @@ export function* renderSteps(layers, source, ctx, cache = null, opts = {}) {
       ctx.masks.delete(layer.id);
     }
 
-    // Stop snapshotting once the budget is spent rather than dropping earlier
-    // entries: the resume scan matches a CONTIGUOUS prefix, so a hole would
-    // invalidate everything after it. Layers past the ceiling simply replay.
-    if (writeCache && cachedBytes < MAX_CACHE_BYTES) {
+    if (writeCache) {
       const prev = cache.length ? cache[cache.length - 1] : null;
       cache.push({ key: keys[i], buf: cloneBuf(acc), masks: cloneMasks(ctx.masks, prev) });
       cachedBytes += acc.data.byteLength;
+      // Always record the key; the budget only governs how many sets of pixels
+      // we hold on to, and where they sit.
+      cachedBytes = evictSnapshots(cache, cachedBytes, maxCacheBytes);
     }
     yield { done: i + 1, total: endIndex, layer };
   }
