@@ -510,12 +510,18 @@ function buildInput(def, params, commit, ctxHint) {
       toggle.type = "button";
       const count = el("span", "param-value");
 
+      // Keyboard shortcuts mutate brushState behind the panel's back ([ ] size,
+      // c cling, e erase), so every widget re-reads it on notify rather than
+      // owning its own copy of the value.
+      const refreshers = [];
+
       const sync = () => {
         const on = brushState.layer?.id === layer?.id;
         toggle.textContent = on ? "Painting — done" : "Paint";
         toggle.classList.toggle("btn-primary", on);
         count.textContent = `${strokes.length} stroke${strokes.length === 1 ? "" : "s"}`;
         sliders.hidden = !on;
+        for (const refresh of refreshers) refresh();
       };
 
       toggle.addEventListener("click", () => {
@@ -541,12 +547,20 @@ function buildInput(def, params, commit, ctxHint) {
           brushState[key] = Number(input.value);
           out.textContent = input.value;
         });
+        refreshers.push(() => {
+          const v = String(brushState[key]);
+          if (input.value !== v) input.value = v;
+          out.textContent = v;
+        });
         row.append(lab, input);
         return row;
       };
       sliders.append(
-        slider("radius", "Size (u)", 2, 300, 1),
+        // 400 matches the ] cap in brush.js and the preset clamp; a clinging
+        // brush wants reach, not a bigger dot.
+        slider("radius", "Size (u)", 2, 400, 1),
         slider("hardness", "Hardness", 0, 1, 0.01),
+        slider("cling", "Cling", 0, 1, 0.01),
         slider("flow", "Flow", 0.02, 1, 0.01)
       );
 
@@ -557,7 +571,7 @@ function buildInput(def, params, commit, ctxHint) {
         brushState.erase = !brushState.erase;
         eraseBtn.classList.toggle("is-active", brushState.erase);
       });
-      eraseBtn.classList.toggle("is-active", brushState.erase);
+      refreshers.push(() => eraseBtn.classList.toggle("is-active", brushState.erase));
 
       const undoBtn = el("button", "btn btn-ghost btn-sm", "Undo");
       undoBtn.type = "button";
@@ -568,7 +582,16 @@ function buildInput(def, params, commit, ctxHint) {
       clearBtn.addEventListener("click", () => { clearStrokes(); sync(); });
 
       row.append(eraseBtn, undoBtn, clearBtn);
-      sliders.append(row, el("span", "param-hint", "[ ] resize · e erase · ⌘Z undo · esc done"));
+      // Cling quietly changes what two of the sliders above mean, so say so
+      // rather than letting the labels lie.
+      const clingNote = el(
+        "span",
+        "param-hint",
+        "cling on — size is reach through the picture, and flow is a ceiling rather than build-up"
+      );
+      refreshers.push(() => { clingNote.hidden = !(brushState.cling > 0); });
+
+      sliders.append(row, clingNote, el("span", "param-hint", "[ ] resize · c cling · e erase · ⌘Z undo · esc done"));
 
       wrap.append(el("div", "ctl-row", null), toggle, count, sliders);
       wrap.firstChild.remove();

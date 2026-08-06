@@ -1,4 +1,5 @@
 import { createMask, blurMask } from "../buffer.js";
+import { buildGuide, geodesicFlood, releaseFlood } from "../geodesic.js";
 import { luma, saturationOf, hueOf, parseHex } from "../color.js";
 import { fbm, noise2, jitteredPoints, pointRandom, curlAngle } from "../rng.js";
 import { SiteGrid } from "../geometry.js";
@@ -196,9 +197,119 @@ function expandFieldBBox(field, x0, y0, x1, y1, erase) {
   field._bbox = b;
 }
 
-function rasterStroke(ctx, field, w, h, stroke, start = 0) {
+/**
+ * Rasterise one edge-aware stroke: reach, not radius.
+ *
+ * The falloff is the same ramp the circular brush uses, but the distance it
+ * ramps over is geodesic — measured through the picture, where crossing an edge
+ * costs extra. So a stroke down a wall fills to the wall's silhouette instead
+ * of to a circle.
+ *
+ * NOTE the max/min accumulation, which differs from the circular brush's
+ * additive build-up and is load-bearing. Geodesic distance from a set of seeds
+ * is the MINIMUM over those seeds, so max(fall(Da), fall(Db)) === fall(min(Da,
+ * Db)): folding a longer version of a stroke over a shorter one lands exactly
+ * where a cold rasterisation of the longer one would. That is what lets the
+ * incremental brush cache re-flood the live stroke each dab and stay
+ * byte-identical to export (verify.js asserts this). It also means a cling
+ * stroke behaves like a selection tool rather than an airbrush — passing over
+ * the same spot twice does not darken it, which is the right feel here.
+ *
+ * `start` is deliberately ignored: the whole stroke is re-flooded, and the
+ * result dominates whatever the previous partial pass left behind.
+ */
+function rasterClingStroke(ctx, guide, field, w, h, stroke) {
+  const pts = stroke.pts;
+  const factor = guide.factor;
+  const cling = Math.max(0, Math.min(1, stroke.cling ?? 0));
+  const hardness = stroke.hardness ?? 0.5;
+  const flow = stroke.flow ?? 1;
+  const erase = !!stroke.erase;
+
+  // The flood runs in working-grid cells but the falloff is evaluated in render
+  // pixels. Those differ only when a small brush meets a decimated export
+  // guide: the flood needs at least one whole cell to travel through, while the
+  // ramp still has to cut at the radius the stroke actually asks for.
+  const reachPx = Math.max(1, ctx.u(stroke.r ?? 20));
+  const reachCells = Math.max(1, reachPx / factor);
+  const inner = reachPx * hardness;
+  const softRange = reachPx - inner || 1;
+
+  // Render pixels -> working-grid cells. boxDownsample averages a factor x
+  // factor block, so cell centres sit half a block in.
+  const half = (factor - 1) / 2;
+  const toCell = (px) => (px - half) / factor;
+
+  const poly = new Float64Array(pts.length);
+  for (let i = 0; i + 1 < pts.length; i += 2) {
+    poly[i] = toCell(pts[i] * w);
+    poly[i + 1] = toCell(pts[i + 1] * h);
+  }
+
+  const flood = geodesicFlood(ctx, guide, poly, reachCells, cling);
+  if (!flood) return;
+
+  // Full-resolution extent of the flooded box.
+  const ax = Math.max(0, Math.floor(flood.x0 * factor + half));
+  const ay = Math.max(0, Math.floor(flood.y0 * factor + half));
+  const bx = Math.min(w - 1, Math.ceil((flood.x0 + flood.w - 1) * factor + half));
+  const by = Math.min(h - 1, Math.ceil((flood.y0 + flood.h - 1) * factor + half));
+  if (bx < ax || by < ay) {
+    releaseFlood(ctx, flood);
+    return;
+  }
+  expandFieldBBox(field, ax, ay, bx, by, erase);
+
+  const dist = flood.dist;
+  const bw = flood.w;
+  const bh = flood.h;
+
+  for (let y = ay; y <= by; y++) {
+    const row = y * w;
+    // Box-local cell coordinate of this render row.
+    const cy = toCell(y) - flood.y0;
+    const cy0 = cy < 0 ? 0 : cy > bh - 1 ? bh - 1 : cy;
+    const y0 = cy0 | 0;
+    const y1 = y0 + 1 < bh ? y0 + 1 : y0;
+    const ty = cy0 - y0;
+    const r0 = y0 * bw;
+    const r1 = y1 * bw;
+
+    for (let x = ax; x <= bx; x++) {
+      const cx = toCell(x) - flood.x0;
+      const cx0 = cx < 0 ? 0 : cx > bw - 1 ? bw - 1 : cx;
+      const x0 = cx0 | 0;
+      const x1 = x0 + 1 < bw ? x0 + 1 : x0;
+      const tx = cx0 - x0;
+
+      const d00 = dist[r0 + x0];
+      const d10 = dist[r0 + x1];
+      const d01 = dist[r1 + x0];
+      const d11 = dist[r1 + x1];
+      const cells =
+        (d00 + (d10 - d00) * tx) * (1 - ty) + (d01 + (d11 - d01) * tx) * ty;
+      const d = cells * factor;
+      if (d >= reachPx) continue;
+
+      const fall = d <= inner ? 1 : 1 - (d - inner) / softRange;
+      const add = fall * flow;
+      const j = row + x;
+      field[j] = erase
+        ? Math.min(field[j], 1 - add)
+        : Math.max(field[j], add);
+    }
+  }
+
+  releaseFlood(ctx, flood);
+}
+
+function rasterStroke(ctx, guide, field, w, h, stroke, start = 0) {
   const pts = stroke?.pts;
   if (!pts || pts.length < 2) return;
+  if (guide && stroke.cling > 0) {
+    rasterClingStroke(ctx, guide, field, w, h, stroke);
+    return;
+  }
   const r = Math.max(1, ctx.u(stroke.r ?? 20));
   const hardness = stroke.hardness ?? 0.5;
   const flow = stroke.flow ?? 1;
@@ -251,8 +362,8 @@ function rasterStroke(ctx, field, w, h, stroke, start = 0) {
   }
 }
 
-function paintField(ctx, field, w, h, strokes) {
-  for (const stroke of strokes ?? []) rasterStroke(ctx, field, w, h, stroke);
+function paintField(ctx, guide, field, w, h, strokes) {
+  for (const stroke of strokes ?? []) rasterStroke(ctx, guide, field, w, h, stroke);
   return field;
 }
 
@@ -280,7 +391,7 @@ const MAX_PAINT_LAYERS = 2;
 const MAX_PAINT_SIZES = 2;
 
 const strokeSignature = (stroke) =>
-  `${stroke?.r ?? 20}|${stroke?.hardness ?? 0.5}|${stroke?.flow ?? 1}|${!!stroke?.erase}`;
+  `${stroke?.r ?? 20}|${stroke?.hardness ?? 0.5}|${stroke?.flow ?? 1}|${!!stroke?.erase}|${stroke?.cling ?? 0}`;
 
 /**
  * FNV-1a over the first `end` coordinates. Points are normalised 0..1 and
@@ -302,10 +413,10 @@ const snapshotStrokes = (strokes) =>
     return { length, signature: strokeSignature(stroke), hash: hashPoints(stroke?.pts, length) };
   });
 
-function cachedPaintField(ctx, w, h, strokes) {
+function cachedPaintField(ctx, guide, w, h, strokes) {
   const layerId = ctx.layerId;
   if (!Array.isArray(strokes) || ctx.mode !== "preview" || !layerId) {
-    return paintField(ctx, new Float32Array(w * h), w, h, strokes);
+    return paintField(ctx, guide, new Float32Array(w * h), w, h, strokes);
   }
 
   let entries = paintPreviewCache.get(layerId);
@@ -320,8 +431,8 @@ function cachedPaintField(ctx, w, h, strokes) {
   const sizeKey = `${w}x${h}`;
   let entry = entries.get(sizeKey);
   if (!entry) {
-    const field = paintField(ctx, new Float32Array(w * h), w, h, strokes);
-    entry = { w, h, field, strokes: snapshotStrokes(strokes), revision: strokes._v };
+    const field = paintField(ctx, guide, new Float32Array(w * h), w, h, strokes);
+    entry = { w, h, field, strokes: snapshotStrokes(strokes), revision: strokes._v, guide };
     entries.set(sizeKey, entry);
     while (entries.size > MAX_PAINT_SIZES) entries.delete(entries.keys().next().value);
     return field;
@@ -332,9 +443,23 @@ function cachedPaintField(ctx, w, h, strokes) {
 
   const before = entry.strokes;
 
+  /**
+   * A clinging field is a function of the strokes AND the picture beneath them,
+   * so the strokes alone cannot decide this cache is still valid. acquireGuide
+   * hands back a stable object for as long as its source is unchanged, which
+   * makes identity the whole test.
+   *
+   * Without it, editing any layer below a cling mask left the preview showing a
+   * mask flooded against the OLD image while export — which never touches this
+   * cache — quietly produced a different one. Wrong in the only direction that
+   * matters: the file disagreeing with the picture you approved.
+   */
+  const guideChanged = entry.guide !== guide;
+
   // Fast path: the revision counter is bumped on every mutation and, unlike
   // object identity, does survive structuredClone.
   if (
+    !guideChanged &&
     entry.revision != null &&
     strokes._v != null &&
     entry.revision === strokes._v &&
@@ -361,33 +486,101 @@ function cachedPaintField(ctx, w, h, strokes) {
     return true;
   };
 
+  // Every incremental route below folds new work into the existing field, which
+  // a new guide invalidates wholesale — the old strokes flooded against a
+  // different picture and there is nothing to fold onto.
   let incremental = false;
-  if (strokes.length === before.length && strokes.length > 0) {
+  if (guideChanged) {
+    // fall through to the rebuild
+  } else if (strokes.length === before.length && strokes.length > 0) {
     const last = strokes.length - 1;
     const oldLength = before[last].length;
     const newLength = strokes[last]?.pts?.length ?? 0;
     if (newLength > oldLength && matchesPrefix(last, oldLength) && prefixUnchanged(last)) {
-      rasterStroke(ctx, entry.field, w, h, strokes[last], Math.max(0, oldLength - 2));
+      // A cling stroke re-floods whole (rasterStroke ignores `start` for those);
+      // its max/min accumulation makes the second pass dominate the first, so
+      // this is still exactly a cold rasterisation.
+      rasterStroke(ctx, guide, entry.field, w, h, strokes[last], Math.max(0, oldLength - 2));
       incremental = true;
     }
   } else if (strokes.length === before.length + 1) {
     if (prefixUnchanged(before.length)) {
-      rasterStroke(ctx, entry.field, w, h, strokes[strokes.length - 1]);
+      rasterStroke(ctx, guide, entry.field, w, h, strokes[strokes.length - 1]);
       incremental = true;
     }
   }
 
   const noChange =
-    !incremental && strokes.length === before.length && prefixUnchanged(before.length);
+    !guideChanged &&
+    !incremental &&
+    strokes.length === before.length &&
+    prefixUnchanged(before.length);
   if (!incremental && !noChange) {
     entry.field.fill(0);
     entry.field._bbox = null;
     entry.field._looseBBox = false;
-    paintField(ctx, entry.field, w, h, strokes);
+    paintField(ctx, guide, entry.field, w, h, strokes);
   }
   entry.strokes = snapshotStrokes(strokes);
   entry.revision = strokes._v;
+  entry.guide = guide;
   return entry.field;
+}
+
+/**
+ * Travel-cost guides, keyed by layer id and render size.
+ *
+ * Building one costs three blurs and three Sobel passes over the frame — fine
+ * once, ruinous on every dab of a stroke. During interactive paint the stack
+ * BELOW the mask layer is cached and does not change, so the accumulator the
+ * guide is derived from is stable; a sampled hash of it recognises that through
+ * the structuredClone to the worker, which object identity cannot.
+ *
+ * Export bypasses the cache for the same reason the paint field does: holding a
+ * 4x Float32 guide after a download costs tens of megabytes.
+ */
+const guideCache = new Map();
+const MAX_GUIDES = 2;
+
+/**
+ * FNV-1a over every pixel of the accumulator, all three colour channels packed
+ * into one word so the whole pixel costs a single multiply.
+ *
+ * This deliberately reads the entire buffer. A strided sample was cheaper but
+ * blind to any change that fell between samples — a small object moving, a
+ * localised datamosh — and the brush would go on clinging to edges that were no
+ * longer in the picture. Guarding a ~10ms guide build with a sub-millisecond
+ * pass is the right trade.
+ */
+function hashBuf(buf) {
+  const d = buf.data;
+  let hash = 2166136261;
+  for (let i = 0; i < d.length; i += 4) {
+    hash = Math.imul(hash ^ (d[i] | (d[i + 1] << 8) | (d[i + 2] << 16)), 16777619);
+  }
+  return (hash ^ buf.w ^ (buf.h << 16)) >>> 0;
+}
+
+function acquireGuide(ctx, src) {
+  if (ctx.mode !== "preview" || !ctx.layerId) return buildGuide(ctx, src);
+
+  const key = `${ctx.layerId}|${src.w}x${src.h}`;
+  const hash = hashBuf(src);
+  const hit = guideCache.get(key);
+  if (hit && hit.hash === hash) {
+    // Re-insert so map order stays least-recently-used first.
+    guideCache.delete(key);
+    guideCache.set(key, hit);
+    return hit.guide;
+  }
+
+  const guide = buildGuide(ctx, src);
+  guideCache.delete(key);
+  guideCache.set(key, { hash, guide });
+  while (guideCache.size > MAX_GUIDES) {
+    guideCache.delete(guideCache.keys().next().value);
+  }
+  return guide;
 }
 
 /** Tight bbox of non-zero samples; null if empty or essentially full-frame. */
@@ -548,9 +741,13 @@ export default {
         saliencyField(src, field, p.centerBias);
         break;
 
-      case "paint":
-        field = cachedPaintField(ctx, w, h, p.strokes);
+      case "paint": {
+        // Only strokes that actually cling need the picture analysed.
+        const needsGuide =
+          Array.isArray(p.strokes) && p.strokes.some((s) => s?.cling > 0);
+        field = cachedPaintField(ctx, needsGuide ? acquireGuide(ctx, src) : null, w, h, p.strokes);
         break;
+      }
 
       case "edge": {
         // Precompute luma once, then Sobel on the plane. Per-sample luma() was

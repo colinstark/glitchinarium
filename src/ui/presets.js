@@ -22,6 +22,16 @@ const STORE_KEY = "glitchinarium.presets.v1";
 const MAX_STROKES = 512;
 const MAX_STROKE_POINTS = 20000; // 10k xy pairs
 
+/**
+ * Clinging strokes are capped far harder than plain ones, because they cost
+ * something else entirely: each runs a geodesic flood over its own reach, which
+ * measures in hundreds of milliseconds at export size rather than the
+ * microseconds a circular stamp takes. 512 of them is over a minute of frozen
+ * render — exactly the unbounded work the caps above exist to prevent. Past the
+ * cap the strokes still paint, just as circles.
+ */
+const MAX_CLING_STROKES = 32;
+
 function coerceStrokes(value) {
   if (!Array.isArray(value)) return [];
   const num = (v, lo, hi, fallback) => {
@@ -29,6 +39,7 @@ function coerceStrokes(value) {
     return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : fallback;
   };
   const out = [];
+  let clinging = 0;
   for (const stroke of value.slice(0, MAX_STROKES)) {
     if (!stroke || typeof stroke !== "object" || !Array.isArray(stroke.pts)) continue;
     const pts = [];
@@ -38,13 +49,22 @@ function coerceStrokes(value) {
     }
     // A stroke needs two points to have a segment to stamp along.
     if (pts.length < 4) continue;
+    let cling = num(stroke.cling, 0, 1, 0);
+    if (cling > 0 && ++clinging > MAX_CLING_STROKES) cling = 0;
     out.push({
       pts,
       r: num(stroke.r, 1, 400, 20),
       hardness: num(stroke.hardness, 0, 1, 0.5),
       flow: num(stroke.flow, 0.01, 1, 1),
+      cling,
       erase: !!stroke.erase,
     });
+  }
+  if (clinging > MAX_CLING_STROKES) {
+    console.warn(
+      `[presets] ${clinging} clinging strokes exceeds the ${MAX_CLING_STROKES} cap; ` +
+      `the rest were imported as plain circular strokes.`
+    );
   }
   return out;
 }

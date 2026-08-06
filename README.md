@@ -108,7 +108,7 @@ quirks that change the look live on the layer card.
 
 | Layer | What it does |
 | --- | --- |
-| **Mask** | Publishes a grayscale field named like `L3` for stencils and `∿` modulation. Sources include luma, edges, saliency, noise, flow, voronoi, shapes, chroma key, and the **paint** brush. **Edge style** / **tear** define the boundary more than the source does. |
+| **Mask** | Publishes a grayscale field named like `L3` for stencils and `∿` modulation. Sources include luma, edges, saliency, noise, flow, voronoi, shapes, chroma key, and the **paint** brush (with **cling** for edge-aware reach). **Edge style** / **tear** define the boundary more than the source does. |
 
 Stack order is composition: top of the list runs first. Masks must sit **above** the processors that use them. Randomize scopes (Tone / Halftone / …) match these categories.
 
@@ -128,9 +128,19 @@ ASCII. The `gradient-ascii` preset demonstrates it.
 
 **The brush is a mask source**, not a paint layer. You paint grey, and any processor
 above binds to it. Painting intensity over a datamosh layer's `amount` scratches
-corrosion in at exactly the strength you brushed. `[` `]` resize, `e` erases, `⌘Z`
-undoes, `esc` finishes. Strokes are stored normalised with radii in artwork units, so a
-mask painted on the preview lands identically on a 4× export.
+corrosion in at exactly the strength you brushed. `[` `]` resize, `c` toggles cling,
+`e` erases, `⌘Z` undoes, `esc` finishes. Strokes are stored normalised with radii in
+artwork units, so a mask painted on the preview lands identically on a 4× export.
+
+**Cling makes the brush content-aware.** At 0 the brush is a circle. Turn it up and
+size stops meaning radius and starts meaning *reach*: paint spreads through pixels that
+look alike and pays to cross local contrast, so one stroke down a wall fills to the
+building's silhouette instead of bleeding into the sky. The travel cost is calibrated on
+each image's own gradient histogram — ordinary texture is free, unusual contrast is a
+wall — so the dial means the same thing on a flat studio shot and a noisy street photo.
+Cling reads the picture, and edges are resolution-dependent, so a clinging stroke is
+*approximately* rather than exactly scale-invariant (as `edge` and `detail` sources
+already are); the plain circular brush keeps its exact guarantee.
 
 **The edge is the signature.** `edgeStyle` breaks a mask boundary into stairs, a bayer
 dissolve, a checker or a weave; `tear` displaces it along a noise flow first. Those

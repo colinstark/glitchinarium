@@ -23,9 +23,18 @@ export const brushState = {
   radius: 40,
   hardness: 0.5,
   flow: 0.7,
+  /**
+   * 0 = the plain circle. Above that, radius stops meaning radius and starts
+   * meaning REACH: paint spreads through pixels that look alike and pays to
+   * cross local contrast, so one stroke down a wall fills to the wall.
+   */
+  cling: 0,
   erase: false,
   active: false, // pointer is down
 };
+
+/** What `c` toggles back to, so the shortcut is not a one-way door. */
+let lastCling = 0.7;
 
 const listeners = new Set();
 export function onBrushChange(fn) {
@@ -113,6 +122,7 @@ export function attachBrush(stage, toImage) {
       r: brushState.radius,
       hardness: brushState.hardness,
       flow: brushState.flow,
+      cling: brushState.cling,
       erase: brushState.erase,
     };
     // A dab needs two points to have a segment to stamp along.
@@ -167,9 +177,16 @@ export function attachBrush(stage, toImage) {
     // and "[" resized the brush.
     if (isTyping()) return;
     if (e.key === "Escape") endPaint();
-    else if (e.key === "[") { brushState.radius = Math.max(2, brushState.radius / 1.25); notify(); }
-    else if (e.key === "]") { brushState.radius = Math.min(400, brushState.radius * 1.25); notify(); }
+    // Rounded because the panel shows this value against a step-1 slider — an
+    // unrounded 25.6 reads as a broken control sitting next to a slider at 25.
+    else if (e.key === "[") { brushState.radius = Math.max(2, Math.round(brushState.radius / 1.25)); notify(); }
+    else if (e.key === "]") { brushState.radius = Math.min(400, Math.round(brushState.radius * 1.25)); notify(); }
     else if (e.key === "e") { brushState.erase = !brushState.erase; notify(); }
+    else if (e.key === "c") {
+      if (brushState.cling > 0) lastCling = brushState.cling;
+      brushState.cling = brushState.cling > 0 ? 0 : lastCling;
+      notify();
+    }
     else if ((e.metaKey || e.ctrlKey) && e.key === "z") { e.preventDefault(); undoStroke(); }
   });
 }

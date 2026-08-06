@@ -336,6 +336,55 @@ console.log("\n\x1b[1mMasking\x1b[0m\n");
   check(mid(lo.mask, 0.5, 0.5) > 0.5 && mid(lo.mask, 0.5, 0.1) < 0.5, "masking: brush field is incorrect");
   check(Math.abs(lo.frac - hi.frac) < 0.01, "masking: brush is not scale invariant");
 
+  // The cling brush measures reach THROUGH the picture. The synthetic source
+  // has a hard bright rectangle spanning u 0.45..0.58; a stroke down its spine
+  // with reach enough to escape it must stay inside anyway, while the same
+  // stroke without cling spills out. Probe at u=0.42, which is outside the
+  // rectangle but well inside the reach.
+  const clingLayer = createLayer("mask");
+  clingLayer.params.source = "paint";
+  clingLayer.params.threshold = 0.01;
+  clingLayer.params.softness = 0.02;
+  clingLayer.params.feather = 0;
+  const clingStroke = (cling) => [{
+    pts: [0.515, 0.25, 0.515, 0.5, 0.515, 0.75],
+    r: 120, hardness: 0.9, flow: 1, cling, erase: false,
+  }];
+  const spill = (buf, ssaa, cling) => {
+    clingLayer.params.strokes = clingStroke(cling);
+    const c = createContext({ renderW: buf.w, renderH: buf.h, ssaa, seed: SEED, mode: "export" });
+    c.forLayer(0, clingLayer);
+    const m = PROCESSORS.mask.compute(c, buf, clingLayer.params);
+    return mid(m, 0.42, 0.5);
+  };
+  const loose = spill(loSource, 1, 0);
+  const clung = spill(loSource, 1, 1);
+  console.log(
+    `  cling stops at edge    ${loose > 0.5 && clung < 0.5 ? "\x1b[32myes\x1b[0m" : "\x1b[31mNO\x1b[0m"}` +
+    ` (off ${loose.toFixed(2)} vs on ${clung.toFixed(2)})`
+  );
+  check(loose > 0.5, "masking: cling probe is out of reach even with cling off");
+  check(clung < 0.5, "masking: cling brush crossed a hard edge");
+
+  // Cling reads the picture, and edges are resolution-dependent, so this is a
+  // deliberately looser bound than the 1% the circular brush holds above.
+  const clingFrac = (buf, ssaa) => {
+    clingLayer.params.strokes = clingStroke(1);
+    const c = createContext({ renderW: buf.w, renderH: buf.h, ssaa, seed: SEED, mode: "export" });
+    c.forLayer(0, clingLayer);
+    const m = PROCESSORS.mask.compute(c, buf, clingLayer.params);
+    let on = 0;
+    for (let i = 0; i < m.data.length; i++) if (m.data[i] > 0.5) on++;
+    return on / m.data.length;
+  };
+  const clingLo = clingFrac(loSource, 1);
+  const clingHi = clingFrac(hiSource, FACTOR);
+  console.log(
+    `  cling scale drift      ${Math.abs(clingLo - clingHi) < 0.05 ? "\x1b[32mbounded\x1b[0m" : "\x1b[31mTOO WIDE\x1b[0m"}` +
+    ` (${(clingLo * 100).toFixed(1)}% vs ${(clingHi * 100).toFixed(1)}%)`
+  );
+  check(Math.abs(clingLo - clingHi) < 0.05, "masking: cling brush drifts too far across render scale");
+
   // Appending points should update the cached preview field incrementally, but
   // must remain byte-for-byte equivalent to a cold export rasterisation.
   const incremental = createLayer("mask");
@@ -394,6 +443,26 @@ console.log("\n\x1b[1mMasking\x1b[0m\n");
   incrementalMask = PROCESSORS.mask.compute(incrementalCtx, loSource, incremental.params);
   reference = PROCESSORS.mask.compute(coldCtx, loSource, incremental.params);
   exact &&= masksEqual(incrementalMask, reference);
+
+  // A cling stroke re-floods whole on every dab and folds the result in with
+  // max/min instead of accumulating. That equals a cold rasterisation only if
+  // the geodesic sweep reaches its exact fixed point, which is what makes
+  // distance monotone in the seed set — this is the check that says it does.
+  // A failure here means MAX_SWEEPS in geodesic.js is capping out.
+  const clingLive = {
+    pts: [0.5, 0.3, 0.5, 0.3],
+    r: 60, hardness: 0.5, flow: 1, cling: 0.8, erase: false,
+  };
+  incremental.params.strokes.push(clingLive);
+  for (let i = 1; i < 12; i++) {
+    clingLive.pts.push(0.5 - (0.2 * i) / 11, 0.3 + (0.35 * i) / 11);
+    incremental.params.strokes._v++;
+    incrementalMask = PROCESSORS.mask.compute(incrementalCtx, loSource, incremental.params);
+  }
+  reference = PROCESSORS.mask.compute(coldCtx, loSource, incremental.params);
+  const clingExact = masksEqual(incrementalMask, reference);
+  exact &&= clingExact;
+  console.log(`  incremental cling      ${clingExact ? "\x1b[32mexact\x1b[0m" : "\x1b[31mDIFFERS\x1b[0m"}`);
   console.log(`  incremental brush      ${exact ? "\x1b[32mexact\x1b[0m" : "\x1b[31mDIFFERS\x1b[0m"}`);
   check(exact, "masking: incremental brush differs from cold rasterisation");
 }
