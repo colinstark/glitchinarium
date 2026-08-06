@@ -14,12 +14,17 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+# GitHub is retiring Node 20 on Actions runners. Force JS actions onto Node 24
+# so deprecation warnings stay quiet even when an action still declares node20.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -39,7 +44,7 @@ jobs:
         run: bun run build
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v4
         with:
           path: dist
 
