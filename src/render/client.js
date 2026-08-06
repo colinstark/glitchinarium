@@ -568,6 +568,9 @@ function makeWorkerClient(workerUrl, opts = {}) {
           sourceKey: job.sourceKey ?? null,
           layers,
           layerPatch,
+          // Present on patch jobs so the worker can reject a shape mismatch
+          // against its sticky stack (see ERR_STALE_PATCH).
+          stackSignature: job.stackSignature ?? null,
           seed: job.seed,
           ssaa: job.ssaa,
           renderW: job.renderW,

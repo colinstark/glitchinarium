@@ -293,17 +293,19 @@ function enqueuePreview() {
   // Abort in-flight work — only the latest seq is allowed to paint the stage.
   renderClient.abort();
   previewChain = previewChain.then(() => renderPreview(seq)).catch((err) => {
-    console.error(err);
     const msg = String(err?.message || err);
     // The worker rejected a patch because its sticky DTO is not the stack we
     // thought it held. It is still healthy — drop the claim and re-render with
     // a full stack, which resyncs both sides. Must precede the /worker/ test
-    // below, whose message would also match.
+    // below, whose message would also match. Log at warn: this is a normal
+    // resync path, not a hard failure.
     if (err?.code === ERR_STALE_PATCH) {
+      console.warn("[preview] sticky desync, full-stack resync");
       state.workerLayerSig = null;
       if (seq === previewSeq && state.image) scheduleRender();
       return;
     }
+    console.error(err);
     if (/worker/i.test(msg)) {
       setStatus("Preview using main thread");
       // Worker path failed open — force a main-thread retry with a full payload.
@@ -598,6 +600,11 @@ async function renderPreview(seq) {
         : useLivePatch
           ? layerLivePatch(editLayer)
           : null,
+      // Worker compares this to the signature of its sticky DTO so a shape
+      // mismatch (same ids, wrong stack) fails loudly instead of patching the
+      // wrong tree. Full DTO jobs do not need it — the worker derives the
+      // signature from the layers it adopts.
+      stackSignature: usePaintPatch || useLivePatch ? stackSig : undefined,
       seed: state.seed,
       ssaa: 1,
       renderW: plan.renderW,
@@ -638,6 +645,16 @@ async function renderPreview(seq) {
 
   if (seq !== previewSeq || state.rendering) {
     if (state.rendering) renderAfterExport = true;
+    // Superseded (or export took the stage): release any transferred bitmap so
+    // rapid scrubbing cannot accumulate unclosed ImageBitmaps. applyPreviewPixels
+    // is the only other close site, and we are skipping it here.
+    if (result?.bitmap && typeof result.bitmap.close === "function") {
+      try {
+        result.bitmap.close();
+      } catch {
+        /* ignore */
+      }
+    }
     return;
   }
 

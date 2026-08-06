@@ -8,10 +8,11 @@
  *
  * A live patch rewrites ONE layer of the stack the worker is holding, so the
  * main thread may only send one while it believes that stack is the current
- * one. When the belief turns out to be wrong the worker cannot render the edit,
- * and rendering the sticky stack regardless would silently drop it. This code
- * distinguishes that recoverable desync from a genuinely broken worker: the
- * caller resends a full stack and everything resyncs, no demotion to main.
+ * one. When the belief turns out to be wrong (missing layer id, or
+ * stackSignature mismatch) the worker cannot render the edit, and rendering
+ * the sticky stack regardless would silently drop it. This code distinguishes
+ * that recoverable desync from a genuinely broken worker: the caller resends a
+ * full stack and everything resyncs, no demotion to main.
  */
 export const ERR_STALE_PATCH = "stale-patch";
 

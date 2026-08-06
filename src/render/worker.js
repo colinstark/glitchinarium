@@ -7,7 +7,7 @@
  */
 
 import { createContext } from "../context.js";
-import { renderAsync } from "../pipeline.js";
+import { renderAsync, stackSignature } from "../pipeline.js";
 import {
   boxDownsample,
   bufFromTransfer,
@@ -24,6 +24,8 @@ let stickySource = null;
 let stickySourceKey = null;
 /** Last full layer DTO for preview — paint jobs patch strokes onto this. */
 let stickyLayers = null;
+/** Signature of stickyLayers (id:type order) — compared on patch jobs. */
+let stickyStackSig = null;
 /** Last transferred mask stamp per id — skip unchanged masks. */
 let maskStamps = new Map();
 let activeJobId = 0;
@@ -56,7 +58,15 @@ function clearSticky() {
 
 function clearLayerSticky() {
   stickyLayers = null;
+  stickyStackSig = null;
   maskStamps = new Map();
+}
+
+/** Throw ERR_STALE_PATCH so main resends a full stack instead of demoting us. */
+function throwStalePatch(message) {
+  const err = new Error(message);
+  err.code = ERR_STALE_PATCH;
+  throw err;
 }
 
 function maskStamp(m) {
@@ -71,11 +81,11 @@ function maskStamp(m) {
  *
  * A stamp is a claim that MAIN ALREADY HOLDS this field, so it only becomes
  * true once the payload is delivered — which is why the new stamps are built
- * aside and handed back as `commitMaskStamps()` for the caller to run beside
- * the postMessage that ships them. Updating them here meant a job packed
- * and then superseded (or one whose result main discarded as stale) left us
- * claiming main had fields it never received; every later frame then reported
- * those masks `unchanged` and main kept an old one, freezing the overlay.
+ * aside and handed back as `commitMaskStamps()` for the caller to run AFTER a
+ * successful postMessage. Committing before postMessage (or at pack time) left
+ * a job whose transfer threw, or one superseded before post, claiming main had
+ * fields it never received; every later frame then reported those masks
+ * `unchanged` and main kept an old one, freezing the overlay.
  */
 function packMasks(ctx, { returnMasks, maskDeltas, maskIds }) {
   const masks = [];
@@ -178,22 +188,34 @@ async function runRenderJob(id, job) {
   let layers;
   if (job.layers) {
     stickyLayers = job.layers;
+    // Derive from what we actually hold — do not trust a caller-supplied
+    // signature, which would be the FULL stack even when the job carried only
+    // a paint-fast PREFIX of the DTO.
+    stickyStackSig = stackSignature(job.layers);
     layers = stickyLayers;
   } else if (job.layerPatch) {
     const patch = job.layerPatch;
+    // Main only patches while it believes our sticky DTO is its current stack.
+    // A missing target or a shape mismatch proves that belief is wrong.
+    // Rendering the sticky stack anyway would drop the edit with no error —
+    // the failure that looked like brush strokes silently refusing to land,
+    // unrecoverable because every following patch preserved the same
+    // divergence. Fail loudly: the client keeps us alive and main resends a
+    // full stack.
+    if (
+      job.stackSignature != null &&
+      stickyStackSig != null &&
+      job.stackSignature !== stickyStackSig
+    ) {
+      throwStalePatch(
+        `render worker: patch stack signature mismatch (got ${job.stackSignature}, sticky ${stickyStackSig})`
+      );
+    }
     const target = stickyLayers?.find((l) => l.id === patch.id);
     if (!target) {
-      // Main only patches while it believes our sticky DTO is its current
-      // stack, so a missing target proves that belief is wrong. Rendering the
-      // sticky stack anyway would drop the edit with no error — the failure
-      // that looked like brush strokes silently refusing to land, unrecoverable
-      // because every following patch preserved the same divergence. Fail loudly
-      // instead: the client keeps us alive and main resends a full stack.
-      const err = new Error(
+      throwStalePatch(
         `render worker: patch target ${patch.id} is not in the sticky stack`
       );
-      err.code = ERR_STALE_PATCH;
-      throw err;
     }
     if (patch.enabled !== undefined) target.enabled = patch.enabled;
     if (patch.opacity !== undefined) target.opacity = patch.opacity;
@@ -315,8 +337,9 @@ async function runRenderJob(id, job) {
   });
 
   // Paint-fast: main keeps the previous full-stack canvas; only masks.
+  // Commit stamps only after postMessage succeeds — a transfer/clone throw
+  // must leave stamps unchanged so the next job re-sends full mask bytes.
   if (job.paintOnly) {
-    commitMaskStamps();
     self.postMessage(
       {
         type: MSG.RESULT,
@@ -331,6 +354,7 @@ async function runRenderJob(id, job) {
       },
       transferList
     );
+    commitMaskStamps();
     return;
   }
 
@@ -353,7 +377,6 @@ async function runRenderJob(id, job) {
     return;
   }
 
-  commitMaskStamps();
   self.postMessage(
     {
       type: MSG.RESULT,
@@ -367,6 +390,7 @@ async function runRenderJob(id, job) {
     },
     transferList
   );
+  commitMaskStamps();
 }
 
 self.onmessage = async (ev) => {
