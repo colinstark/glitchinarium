@@ -232,6 +232,43 @@ console.log("\n\x1b[1mLayer cache\x1b[0m\n");
   check(invalidates, "cache: upstream edit did not invalidate downstream");
 }
 
+// Snapshots carry the published mask map too, and layers above a mask resume
+// from it. A stack WITHOUT a mask cannot catch a fault in that half.
+{
+  const maskLayer = createLayer("mask");
+  maskLayer.params.source = "radial";
+  const scoped = (type) => {
+    const l = createLayer(type);
+    l.mask = maskLayer.id;
+    return l;
+  };
+  const stack = [maskLayer, scoped("levels"), scoped("gradient-map"), scoped("rgb-split")];
+  const cache = [];
+  const ctxOf = () => createContext({ renderW: loSource.w, renderH: loSource.h, ssaa: 1, seed: SEED });
+
+  render(stack, loSource, ctxOf(), cache);
+  stack[3].params.amount = 0.7; // resume from the snapshot below
+  const warm = render(stack, loSource, ctxOf(), cache);
+  const cold = render(stack, loSource, ctxOf(), null);
+  const matches = identical(warm, cold);
+  console.log(`  masked cached === cold ${matches ? "\x1b[32myes\x1b[0m" : "\x1b[31mNO\x1b[0m"}`);
+  check(matches, "cache: masked stack resumed to a different result");
+
+  // Editing the mask itself must reach every layer scoped by it.
+  maskLayer.params.extent = 0.2;
+  const edited = render(stack, loSource, ctxOf(), cache);
+  const editedCold = render(stack, loSource, ctxOf(), null);
+  const propagates = identical(edited, editedCold);
+  console.log(`  mask edit propagates   ${propagates ? "\x1b[32myes\x1b[0m" : "\x1b[31mNO\x1b[0m"}`);
+  check(propagates, "cache: mask edit did not reach layers scoped by it");
+
+  // One field backs every snapshot that carries it — see cloneMasks.
+  const fields = new Set(cache.map((c) => c.masks?.get(maskLayer.id)?.data).filter(Boolean));
+  const held = cache.filter((c) => c.masks?.get(maskLayer.id)).length;
+  console.log(`  mask stored once       ${fields.size === 1 ? "\x1b[32myes\x1b[0m" : "\x1b[31mNO\x1b[0m"} (${held} snapshots, ${fields.size} copies)`);
+  check(fields.size === 1, "cache: mask field copied once per snapshot instead of shared");
+}
+
 // --------------------------------------------------------- masks & emission
 
 console.log("\n\x1b[1mMasking\x1b[0m\n");

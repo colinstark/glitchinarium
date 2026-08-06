@@ -21,25 +21,42 @@ export function nextLayerId() {
 
 /**
  * Deep-copy a mask map so cache snapshots own their Float32 data.
- * Unchanged mask identities (same data buffer reference as previous snapshot)
- * are shared to avoid re-copying multi-megabyte fields on every layer.
+ *
+ * A published mask is write-once — every consumer either reads it or replaces
+ * the whole entry — so one copy can back every snapshot that carries the same
+ * field. `snapshots` (live mask object → the copy already made for it, for the
+ * duration of one render) is what recognises that.
+ *
+ * Comparing `old.data === m.data` against the previous snapshot cannot: that
+ * snapshot deep-copied its data, so it never again matches the live field it
+ * came from. The test only ever fired on the resume path, where ctx.masks holds
+ * snapshot objects directly — so on a fresh render every layer above a mask
+ * re-copied the entire field, once per layer, for the life of the session.
  */
-function cloneMasks(map, prevSnap) {
+function cloneMasks(map, prevSnap, snapshots) {
   const out = new Map();
   const prev = prevSnap?.masks;
   for (const [id, m] of map) {
+    const shared = snapshots?.get(m);
+    if (shared) {
+      out.set(id, shared);
+      continue;
+    }
     const old = prev?.get(id);
+    let copy;
     if (old && old.data === m.data && old.w === m.w && old.h === m.h) {
-      out.set(id, old);
+      copy = old;
     } else {
-      out.set(id, {
+      copy = {
         w: m.w,
         h: m.h,
         data: new Float32Array(m.data),
         bbox: m.bbox ?? null,
         _rev: m._rev ?? null,
-      });
+      };
     }
+    out.set(id, copy);
+    snapshots?.set(m, copy);
   }
   return out;
 }
@@ -356,6 +373,8 @@ export function* renderSteps(layers, source, ctx, cache = null, opts = {}) {
   }
 
   const derivedCache = new Map();
+  /** Live mask object → the snapshot copy already made for it, this render. */
+  const maskSnapshots = new Map();
 
   for (let i = start; i < endIndex; i++) {
     const layer = layers[i];
@@ -403,7 +422,11 @@ export function* renderSteps(layers, source, ctx, cache = null, opts = {}) {
 
     if (writeCache) {
       const prev = cache.length ? cache[cache.length - 1] : null;
-      cache.push({ key: keys[i], buf: cloneBuf(acc), masks: cloneMasks(ctx.masks, prev) });
+      cache.push({
+        key: keys[i],
+        buf: cloneBuf(acc),
+        masks: cloneMasks(ctx.masks, prev, maskSnapshots),
+      });
       cachedBytes += acc.data.byteLength;
       // Always record the key; the budget only governs how many sets of pixels
       // we hold on to, and where they sit.
