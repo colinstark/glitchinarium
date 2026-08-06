@@ -14,55 +14,131 @@
   </head>
   <body>
     <div class="app">
-      <aside class="panel">
-        <header class="panel-head">
-          <div class="panel-brand">
-            <h1>Glitchinarium</h1>
-            <p class="subtitle">Layered image processor</p>
-          </div>
-          <div class="head-preset">
-            <label class="sr-only" for="preset">Preset</label>
-            <select class="ctl-select head-preset-select" id="preset" title="Load preset"></select>
-            <div class="head-preset-actions">
-              <button type="button" class="btn btn-ghost btn-sm" id="preset-save" title="Save current stack as preset">
-                Save
-              </button>
-              <button type="button" class="btn btn-ghost btn-sm" id="preset-export" title="Export preset JSON">
-                Export
-              </button>
-              <button type="button" class="btn btn-ghost btn-sm" id="preset-import" title="Import preset JSON">
-                Import
-              </button>
-            </div>
-          </div>
-        </header>
+      <header class="topbar">
+        <div class="topbar-brand">
+          <h1>Glitchinarium</h1>
+          <p class="subtitle">Layered image processor</p>
+        </div>
 
-        <div class="panel-body">
-        <section class="block">
-          <div class="block-title">Source</div>
-          <div
-            class="dropzone"
-            id="dropzone"
-            role="button"
-            tabindex="0"
-            aria-label="Drop an image, or click to choose"
+        <div class="topbar-div" aria-hidden="true"></div>
+
+        <!-- The Source block lives here on wide screens and is moved into the
+             sidebar below 900px (see syncSourcePlacement in main.js). -->
+        <div class="topbar-source-slot" id="source-slot">
+          <section class="block" id="source-block">
+            <div class="block-title">Source</div>
+            <div
+              class="dropzone"
+              id="dropzone"
+              role="button"
+              tabindex="0"
+              aria-label="Drop an image, or click to choose"
+            >
+              <canvas
+                class="dropzone-thumb"
+                id="source-thumb"
+                width="48"
+                height="48"
+                hidden
+                aria-hidden="true"
+              ></canvas>
+              <div class="dropzone-copy">
+                <span id="dropzone-label">Drop an image, or click to choose</span>
+                <span class="dropzone-meta" id="source-meta"></span>
+              </div>
+            </div>
+            <input type="file" id="source-input" accept="image/*" hidden />
+          </section>
+        </div>
+
+        <div class="topbar-div" aria-hidden="true"></div>
+
+        <div class="topbar-preset">
+          <label class="sr-only" for="preset">Preset</label>
+          <select class="ctl-select topbar-preset-select" id="preset" title="Load preset"></select>
+          <button type="button" class="btn btn-ghost btn-sm" id="preset-save" title="Save current stack as preset">
+            Save
+          </button>
+          <button type="button" class="btn btn-ghost btn-sm" id="preset-export" title="Export preset JSON">
+            Export
+          </button>
+          <button type="button" class="btn btn-ghost btn-sm" id="preset-import" title="Import preset JSON">
+            Import
+          </button>
+        </div>
+
+        <div class="topbar-export">
+          <button type="button" class="btn btn-primary" id="export-btn" disabled>Export PNG</button>
+          <button
+            type="button"
+            class="btn btn-primary btn-caret"
+            id="export-opts-btn"
+            aria-haspopup="dialog"
+            aria-label="Export settings"
+            title="Export settings"
+            disabled
           >
-            <canvas
-              class="dropzone-thumb"
-              id="source-thumb"
-              width="48"
-              height="48"
-              hidden
-              aria-hidden="true"
-            ></canvas>
-            <div class="dropzone-copy">
-              <span id="dropzone-label">Drop an image, or click to choose</span>
-              <span class="dropzone-meta" id="source-meta"></span>
+            ▾
+          </button>
+        </div>
+
+        <!-- Portaled to <body> by attachPopover. -->
+        <div class="popover export-menu" id="export-menu" hidden role="dialog" aria-label="Export settings">
+          <div class="popover-row">
+            <span class="popover-label">Scale</span>
+            <div class="seg" id="export-scale" role="radiogroup" aria-label="Export scale">
+              <button type="button" class="seg-btn" data-scale="1" role="radio" aria-checked="false">1×</button>
+              <button type="button" class="seg-btn is-active" data-scale="2" role="radio" aria-checked="true">2×</button>
+              <button type="button" class="seg-btn" data-scale="4" role="radio" aria-checked="false">4×</button>
             </div>
           </div>
-          <input type="file" id="source-input" accept="image/*" hidden />
-        </section>
+          <div class="popover-row">
+            <span class="popover-label">Format</span>
+            <div class="seg" id="export-format" role="radiogroup" aria-label="Export format">
+              <button type="button" class="seg-btn is-active" data-format="png" role="radio" aria-checked="true">PNG</button>
+              <button type="button" class="seg-btn" data-format="jpg" role="radio" aria-checked="false">JPG</button>
+            </div>
+          </div>
+          <div class="popover-row">
+            <span class="popover-label">Quality</span>
+            <div class="seg" id="export-quality" role="radiogroup" aria-label="Export quality">
+              <button
+                type="button"
+                class="seg-btn"
+                data-quality="fast"
+                role="radio"
+                aria-checked="false"
+                title="No supersampling — fastest"
+              >
+                Fast
+              </button>
+              <button
+                type="button"
+                class="seg-btn is-active"
+                data-quality="balanced"
+                role="radio"
+                aria-checked="true"
+                title="Up to 2× supersample"
+              >
+                Balanced
+              </button>
+              <button
+                type="button"
+                class="seg-btn"
+                data-quality="quality"
+                role="radio"
+                aria-checked="false"
+                title="Up to 4× supersample — sharpest"
+              >
+                Quality
+              </button>
+            </div>
+          </div>
+        </div>
+      </header>
 
+      <aside class="panel">
+        <div class="panel-body" id="panel-body">
         <section class="block" aria-label="Global">
           <div class="param">
             <label class="param-label">
@@ -117,53 +193,6 @@
           <button type="button" class="btn btn-add" id="add-layer">+ Add layer</button>
         </section>
         </div>
-
-        <section class="block block-export" aria-label="Export">
-          <div class="export-opts">
-            <div class="seg" id="export-scale" role="radiogroup" aria-label="Export scale">
-              <button type="button" class="seg-btn" data-scale="1" role="radio" aria-checked="false">1×</button>
-              <button type="button" class="seg-btn is-active" data-scale="2" role="radio" aria-checked="true">2×</button>
-              <button type="button" class="seg-btn" data-scale="4" role="radio" aria-checked="false">4×</button>
-            </div>
-            <div class="seg" id="export-format" role="radiogroup" aria-label="Export format">
-              <button type="button" class="seg-btn is-active" data-format="png" role="radio" aria-checked="true">PNG</button>
-              <button type="button" class="seg-btn" data-format="jpg" role="radio" aria-checked="false">JPG</button>
-            </div>
-          </div>
-          <div class="seg" id="export-quality" role="radiogroup" aria-label="Export quality">
-            <button
-              type="button"
-              class="seg-btn"
-              data-quality="fast"
-              role="radio"
-              aria-checked="false"
-              title="No supersampling — fastest"
-            >
-              Fast
-            </button>
-            <button
-              type="button"
-              class="seg-btn is-active"
-              data-quality="balanced"
-              role="radio"
-              aria-checked="true"
-              title="Up to 2× supersample"
-            >
-              Balanced
-            </button>
-            <button
-              type="button"
-              class="seg-btn"
-              data-quality="quality"
-              role="radio"
-              aria-checked="false"
-              title="Up to 4× supersample — sharpest"
-            >
-              Quality
-            </button>
-          </div>
-          <button type="button" class="btn btn-primary" id="export-btn" disabled>Export PNG</button>
-        </section>
       </aside>
 
       <main class="stage" id="stage">

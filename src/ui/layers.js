@@ -16,6 +16,7 @@ import { BLEND_MODES } from "../buffer.js";
 import { buildControls, attachScrubEvents } from "./controls.js";
 import { randomizeLayer } from "./randomize.js";
 import { beginPaint, endPaint, brushState } from "./brush.js";
+import { attachPopover } from "./popover.js";
 
 const el = (tag, cls, text) => {
   const n = document.createElement(tag);
@@ -474,8 +475,16 @@ export function createLayerStack({
   wrap.append(addButton);
 
   const menu = el("div", "add-menu");
-  menu.hidden = true;
   menu.setAttribute("role", "menu");
+  addButton.setAttribute("aria-haspopup", "menu");
+  const pop = attachPopover({
+    trigger: addButton,
+    anchor: wrap,
+    menu,
+    placement: "top",
+    matchWidth: true,
+  });
+
   // Mask first — the rest of the workflow depends on knowing it exists.
   const cats = processorsByCategory().slice().sort((a, b) => {
     if (a.id === "mask") return -1;
@@ -493,14 +502,13 @@ export function createLayerStack({
         const layer = createLayer(proc.id);
         setLayers([...getLayers(), layer]);
         if (proc.kind === "mask") setPreviewMaskId(layer.id);
-        closeMenu();
+        pop.close();
         render();
         onChange();
       });
       menu.append(b);
     }
   }
-  document.body.append(menu);
 
   // Quick-add mask at the end of the stack (user then adds effects below, or
   // uses "+ Mask above" on an existing effect).
@@ -511,52 +519,6 @@ export function createLayerStack({
     insertMaskAbove(getLayers().length, { bind: false });
   });
   wrap.append(addMaskBtn);
-
-  function positionMenu() {
-    const br = addButton.getBoundingClientRect();
-    const gap = 6;
-    const maxH = Math.min(22 * 16, Math.max(120, br.top - 12));
-    menu.style.left = `${Math.round(br.left)}px`;
-    menu.style.width = `${Math.round(br.width)}px`;
-    menu.style.bottom = `${Math.round(window.innerHeight - br.top + gap)}px`;
-    menu.style.top = "auto";
-    menu.style.right = "auto";
-    menu.style.maxHeight = `${Math.round(maxH)}px`;
-  }
-
-  function openMenu() {
-    positionMenu();
-    menu.hidden = false;
-    addButton.classList.add("is-open");
-    addButton.setAttribute("aria-expanded", "true");
-  }
-
-  function closeMenu() {
-    menu.hidden = true;
-    addButton.classList.remove("is-open");
-    addButton.setAttribute("aria-expanded", "false");
-  }
-
-  addButton.setAttribute("aria-haspopup", "menu");
-  addButton.setAttribute("aria-expanded", "false");
-
-  addButton.addEventListener("click", (e) => {
-    e.stopPropagation();
-    if (menu.hidden) openMenu();
-    else closeMenu();
-  });
-
-  document.addEventListener("click", (e) => {
-    if (menu.hidden) return;
-    if (menu.contains(e.target) || wrap.contains(e.target)) return;
-    closeMenu();
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !menu.hidden) closeMenu();
-  });
-  window.addEventListener("resize", () => {
-    if (!menu.hidden) positionMenu();
-  });
 
   return { render };
 }

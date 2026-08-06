@@ -21,6 +21,7 @@ import {
 import { createLayerStack } from "./ui/layers.js";
 import { pickFile } from "./ui/controls.js";
 import { brushState, attachBrush, onBrushChange, endPaint } from "./ui/brush.js";
+import { attachPopover } from "./ui/popover.js";
 import { randomizeParams, randomizeStack, SCOPES } from "./ui/randomize.js";
 import { soleDirtyLayerId, clearDirtyLayers, stackSignature } from "./pipeline.js";
 import {
@@ -752,7 +753,7 @@ async function decodeImageFile(file) {
 /** Bumped on every load attempt so a slower earlier decode cannot win. */
 let loadGen = 0;
 
-/** Sidebar Source dropzone thumb — letterboxed into a fixed square. */
+/** Source dropzone thumb — letterboxed into its rendered square. */
 function updateSourceThumb(drawable, w, h) {
   const thumb = $("source-thumb");
   if (!thumb || !drawable || !w || !h) {
@@ -764,7 +765,8 @@ function updateSourceThumb(drawable, w, h) {
     return;
   }
 
-  const size = 48;
+  // CSS drives the box (--thumb): 26px in the topbar, 48px in the sidebar.
+  const size = thumb.clientWidth || 48;
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const px = Math.round(size * dpr);
   thumb.width = px;
@@ -830,7 +832,7 @@ async function loadImageFile(file) {
     $("dropzone").classList.add("has-file");
     updateSourceThumb(state.image.drawable, state.image.w, state.image.h);
     $("stage").classList.add("has-image");
-    $("export-btn").disabled = false;
+    setExportEnabled(true);
     state.cacheKey = "";
     state.workerHasSource = false;
     state.workerLayerSig = null;
@@ -870,6 +872,24 @@ sourceInput.addEventListener("change", () => {
   const file = sourceInput.files?.[0];
   if (file) loadImageFile(file);
 });
+
+// The Source block is a compact chip in the topbar on wide screens, and a full
+// dropzone at the top of the sidebar once the topbar has no room for it. We move
+// the live node rather than duplicating markup, so every listener above stays
+// bound — only the CSS context (and thumb size) changes.
+if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+  const narrowMq = window.matchMedia("(max-width: 900px)");
+  const syncSourcePlacement = () => {
+    const block = $("source-block");
+    if (!block) return;
+    if (narrowMq.matches) $("panel-body").prepend(block);
+    else $("source-slot").append(block);
+    // Re-rasterise: the thumb's CSS box differs between the two homes.
+    if (state.image) updateSourceThumb(state.image.drawable, state.image.w, state.image.h);
+  };
+  narrowMq.addEventListener?.("change", syncSourcePlacement);
+  syncSourcePlacement();
+}
 
 // Stop the browser from navigating away when a file is dropped anywhere.
 window.addEventListener("dragover", (e) => {
@@ -1127,6 +1147,23 @@ scaleGroup.addEventListener("click", (e) => {
 const formatGroup = $("export-format");
 const exportBtn = $("export-btn");
 
+// Scale / format / quality live behind the caret; the settings panel is portaled
+// out of the topbar so it cannot be clipped.
+attachPopover({
+  trigger: $("export-opts-btn"),
+  menu: $("export-menu"),
+  placement: "bottom",
+  align: "right",
+});
+
+/** The export button and its settings caret enable together. */
+function setExportEnabled(on) {
+  const btn = $("export-btn");
+  const caret = $("export-opts-btn");
+  if (btn) btn.disabled = !on;
+  if (caret) caret.disabled = !on;
+}
+
 function syncExportButtonLabel() {
   const label = state.format === "jpg" ? "JPG" : "PNG";
   exportBtn.textContent = `Export ${label}`;
@@ -1208,7 +1245,7 @@ exportBtn.addEventListener("click", async () => {
   exportCancelled = false;
   // Cancel any in-flight preview so it does not touch the cache mid-export.
   previewSeq++;
-  exportBtn.disabled = true;
+  setExportEnabled(false);
   const overlay = $("overlay");
   const fill = $("overlay-fill");
   if (overlayCancel) overlayCancel.disabled = false;
@@ -1255,7 +1292,7 @@ exportBtn.addEventListener("click", async () => {
     overlay.hidden = true;
     fill.style.transform = "scaleX(0)";
     state.rendering = false;
-    exportBtn.disabled = false;
+    setExportEnabled(true);
     if (renderAfterExport) {
       renderAfterExport = false;
       scheduleRender();

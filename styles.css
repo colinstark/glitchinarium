@@ -54,11 +54,9 @@
 
   /* Elevation */
   --shadow-menu: 0 16px 36px -12px oklch(0 0 0 / 0.7), 0 0 0 1px oklch(1 0 0 / 0.04);
-  --shadow-export: 0 -12px 28px -14px oklch(0 0 0 / 0.6);
 
   /* z-index scale */
   --z-status: 3;
-  --z-export: 4;
   --z-sticky: 5;
   --z-overlay: 20;
   --z-menu: 1000;
@@ -116,11 +114,134 @@ summary:focus-visible,
 
 .app {
   display: grid;
-  grid-template-columns: var(--panel-w) 1fr;
+  /* Both tracks use minmax(0, …): the stage's abspos canvas-holder and the
+     topbar's min-content width would otherwise push past the viewport. */
+  grid-template-columns: var(--panel-w) minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   height: 100vh;
   height: 100dvh;
   min-height: 0;
   overflow: hidden;
+}
+
+/* ----------------------------------------------------------------- topbar */
+
+/* One header across the whole app: brand, source, presets, export. */
+.topbar {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  z-index: var(--z-sticky);
+  min-width: 0;
+}
+
+.topbar-brand {
+  flex: none;
+  min-width: 0;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+  white-space: nowrap;
+}
+
+.subtitle {
+  margin: 0.08rem 0 0;
+  font-size: 0.62rem;
+  color: var(--muted);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Hairline group separator */
+.topbar-div {
+  flex: none;
+  width: 1px;
+  height: 1.6rem;
+  background: var(--border);
+}
+
+.topbar-source-slot {
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+/* The Source block is reparented between here and the sidebar at 900px, so
+   both presentations are contextual on the same node. */
+.topbar #source-block {
+  display: block;
+  min-width: 0;
+  padding: 0;
+  border: none;
+}
+
+.topbar #source-block .block-title {
+  display: none;
+}
+
+.topbar .dropzone {
+  --thumb: 26px;
+  max-width: 15rem;
+  padding: 0.32rem 0.5rem;
+  font-size: 0.72rem;
+  border-radius: var(--radius-sm);
+}
+
+.topbar .dropzone.has-file {
+  gap: 0.45rem;
+  padding: 0.28rem 0.45rem;
+}
+
+.topbar-preset {
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.topbar-preset-select {
+  flex: 0 1 12rem;
+  min-width: 0;
+  font-size: 0.72rem;
+  padding: 0.28rem 0.4rem;
+}
+
+.topbar-preset .btn {
+  flex: none;
+  padding: 0.2rem 0.4rem;
+  font-size: 0.66rem;
+}
+
+/* Export sits hard right; the caret is welded to the primary button. */
+.topbar-export {
+  margin-left: auto;
+  flex: none;
+  display: flex;
+}
+
+.topbar-export .btn-primary {
+  padding: 0.36rem 0.75rem;
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+}
+
+/* Scoped so it outranks .btn-primary's border-color: transparent, and reads on
+   both the accent and the disabled-accent fill. */
+.topbar-export .btn-caret {
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  border-left-color: oklch(0 0 0 / 0.28);
+  padding: 0.36rem 0.45rem;
+  font-size: 0.7rem;
+  line-height: 1;
 }
 
 /* ------------------------------------------------------------------ panel */
@@ -147,69 +268,6 @@ summary:focus-visible,
   padding-bottom: var(--space-2);
 }
 
-/* Header: title + presets on one row — pinned above the scroll body */
-.panel-head {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-3) var(--space-5);
-  border-bottom: 1px solid var(--border);
-  flex: none;
-  background: var(--bg-elevated);
-  z-index: var(--z-sticky);
-  min-width: 0;
-}
-
-.panel-brand {
-  flex: 0 1 auto;
-  min-width: 0;
-}
-
-.panel-head h1 {
-  margin: 0;
-  font-size: 0.9rem;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  line-height: 1.15;
-  white-space: nowrap;
-}
-
-.subtitle {
-  margin: 0.08rem 0 0;
-  font-size: 0.62rem;
-  color: var(--muted);
-  letter-spacing: 0.01em;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.head-preset {
-  flex: 1 1 auto;
-  display: grid;
-  gap: 0.28rem;
-  min-width: 0;
-  align-content: center;
-}
-
-.head-preset-select {
-  width: 100%;
-  min-width: 0;
-  font-size: 0.72rem;
-  padding: 0.28rem 0.4rem;
-}
-
-.head-preset-actions {
-  display: flex;
-  gap: 0.2rem;
-}
-
-.head-preset-actions .btn {
-  flex: 1 1 auto;
-  padding: 0.2rem 0.35rem;
-  font-size: 0.66rem;
-}
-
 .sr-only {
   position: absolute;
   width: 1px;
@@ -230,6 +288,11 @@ summary:focus-visible,
   gap: var(--space-3);
   align-content: start;
   flex: none;
+}
+
+/* No export footer below any more — don't leave a hairline floating mid-panel. */
+.panel-body > .block:last-child {
+  border-bottom: none;
 }
 
 .block-grow {
@@ -274,42 +337,6 @@ summary:focus-visible,
   font-size: 0.65rem;
   color: var(--faint);
   opacity: 0.9;
-}
-
-/* Export footer — always pinned to the panel bottom, outside the scroll. */
-.block-export {
-  position: relative;
-  flex: none;
-  margin-top: auto;
-  background: var(--bg-elevated);
-  border-top: 1px solid var(--border);
-  border-bottom: none;
-  box-shadow: var(--shadow-export);
-  z-index: var(--z-export);
-  gap: var(--space-2);
-  padding-top: var(--space-3);
-  padding-bottom: var(--space-3);
-}
-
-/* Soft fade so scrolling layers don't hard-clip into the export bar. */
-.block-export::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 100%;
-  height: 1.1rem;
-  pointer-events: none;
-  background: linear-gradient(
-    to bottom,
-    oklch(0.175 0.014 260 / 0),
-    var(--bg-elevated)
-  );
-}
-
-.block-export .btn-primary {
-  width: 100%;
-  padding: 0.55rem 0.75rem;
 }
 
 /* ---------------------------------------------------------------- widgets */
@@ -465,8 +492,10 @@ summary:focus-visible,
 
 .dropzone-thumb {
   display: none;
-  width: 48px;
-  height: 48px;
+  /* updateSourceThumb() rasterises to this measured size — it shrinks in the
+     topbar and returns to 48px when the block moves into the sidebar. */
+  width: var(--thumb, 48px);
+  height: var(--thumb, 48px);
   border-radius: calc(var(--radius) - 2px);
   border: 1px solid var(--border);
   background: var(--bg);
@@ -1256,7 +1285,50 @@ summary:focus-visible,
   background: var(--warn-soft);
 }
 
-/* Add-layer menu (portaled to body) */
+/* Portaled popovers (attachPopover) — add-layer menu, export settings */
+.popover {
+  position: fixed;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  z-index: var(--z-menu);
+  box-shadow: var(--shadow-menu);
+}
+
+.popover[hidden] {
+  display: none;
+}
+
+.popover-row {
+  display: grid;
+  grid-template-columns: 4.2rem 1fr;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.popover-label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--faint);
+  font-weight: 600;
+}
+
+.export-menu {
+  display: grid;
+  /* Wide enough that "Balanced" / "Quality" don't wrap in the 3-up seg. */
+  width: 20rem;
+  gap: var(--space-2);
+  padding: var(--space-3);
+}
+
+.popover-row .seg-btn {
+  white-space: nowrap;
+}
+
+/* Add-layer menu */
 .add-wrap {
   position: relative;
   flex: none;
@@ -1265,21 +1337,9 @@ summary:focus-visible,
 }
 
 .add-menu {
-  position: fixed;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  background: var(--bg-elevated);
   padding: 0.35rem;
   display: grid;
   gap: 0.08rem;
-  overflow-y: auto;
-  scrollbar-width: thin;
-  z-index: var(--z-menu);
-  box-shadow: var(--shadow-menu);
-}
-
-.add-menu[hidden] {
-  display: none;
 }
 
 .add-cat {
@@ -1397,24 +1457,14 @@ summary:focus-visible,
   transform: scale(0.98);
 }
 
-.export-opts {
-  display: grid;
-  grid-template-columns: 1.45fr 1fr;
-  gap: var(--space-2);
-  align-items: stretch;
-}
-
-.export-opts .seg {
+.popover-row .seg {
   min-width: 0;
-}
-
-#export-quality {
-  width: 100%;
 }
 
 #export-quality .seg-btn {
   font-family: var(--font);
   font-size: 0.72rem;
+  padding: 0.4rem 0.25rem;
 }
 
 .status {
@@ -1637,8 +1687,24 @@ summary:focus-visible,
 
 @media (max-width: 900px) {
   .app {
-    grid-template-columns: 1fr;
-    grid-template-rows: minmax(0, 42dvh) minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 42dvh) minmax(0, 1fr);
+  }
+
+  .topbar {
+    order: 0;
+    padding: var(--space-2) var(--space-3);
+  }
+
+  /* Source moves into the sidebar here (syncSourcePlacement), so the topbar
+     keeps only brand + preset + export. */
+  .topbar .subtitle,
+  .topbar-div {
+    display: none;
+  }
+
+  .topbar-preset-select {
+    flex: 1 1 auto;
   }
 
   .panel {
@@ -1654,11 +1720,6 @@ summary:focus-visible,
     height: auto;
   }
 
-  .panel-head {
-    position: relative;
-    backdrop-filter: none;
-  }
-
   .status {
     left: 0.55rem;
     bottom: 0.55rem;
@@ -1672,10 +1733,6 @@ summary:focus-visible,
   .btn-icon {
     min-width: 2rem;
     min-height: 2rem;
-  }
-
-  .export-opts {
-    grid-template-columns: 1fr 1fr;
   }
 
   .seg-btn {
