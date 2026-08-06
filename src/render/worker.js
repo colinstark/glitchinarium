@@ -15,7 +15,7 @@ import {
   bufToImageData,
   createSurface,
 } from "../buffer.js";
-import { MSG } from "./protocol.js";
+import { MSG, ERR_STALE_PATCH } from "./protocol.js";
 
 /** @type {Array<{key:string, buf:any, masks:Map}>} */
 let previewCache = [];
@@ -68,17 +68,29 @@ function maskStamp(m) {
 /**
  * Pack masks for transfer. With maskDeltas, skip payloads whose stamp matches
  * the last send. maskIds (if set) filters to those ids only.
+ *
+ * A stamp is a claim that MAIN ALREADY HOLDS this field, so it only becomes
+ * true once the payload is delivered — which is why the new stamps are built
+ * aside and handed back as `commitMaskStamps()` for the caller to run beside
+ * the postMessage that ships them. Updating them here meant a job packed
+ * and then superseded (or one whose result main discarded as stale) left us
+ * claiming main had fields it never received; every later frame then reported
+ * those masks `unchanged` and main kept an old one, freezing the overlay.
  */
 function packMasks(ctx, { returnMasks, maskDeltas, maskIds }) {
   const masks = [];
   const transferList = [];
   const removedMaskIds = [];
+  const nextStamps = new Map(maskStamps);
+  const commitMaskStamps = () => {
+    maskStamps = nextStamps;
+  };
   if (!returnMasks || !ctx.masks?.size) {
-    if (maskDeltas && maskStamps.size) {
-      for (const id of maskStamps.keys()) removedMaskIds.push(id);
-      maskStamps = new Map();
+    if (maskDeltas && nextStamps.size) {
+      for (const id of nextStamps.keys()) removedMaskIds.push(id);
+      nextStamps.clear();
     }
-    return { masks, transferList, removedMaskIds };
+    return { masks, transferList, removedMaskIds, commitMaskStamps };
   }
 
   const allow = maskIds?.length ? new Set(maskIds) : null;
@@ -92,7 +104,7 @@ function packMasks(ctx, { returnMasks, maskDeltas, maskIds }) {
       masks.push({ id: maskId, unchanged: true });
       continue;
     }
-    maskStamps.set(maskId, stamp);
+    nextStamps.set(maskId, stamp);
     const copy = m.data.buffer.slice(
       m.data.byteOffset,
       m.data.byteOffset + m.data.byteLength
@@ -109,27 +121,27 @@ function packMasks(ctx, { returnMasks, maskDeltas, maskIds }) {
   }
 
   if (maskDeltas) {
-    for (const id of [...maskStamps.keys()]) {
+    for (const id of [...nextStamps.keys()]) {
       if (!seen.has(id) && (!allow || allow.has(id))) {
         // Only drop stamps for masks we would have considered this frame.
         if (!allow || !ctx.masks.has(id)) {
-          maskStamps.delete(id);
+          nextStamps.delete(id);
           removedMaskIds.push(id);
         }
       }
     }
     // Full mask map: remove stamps for masks no longer present.
     if (!allow) {
-      for (const id of [...maskStamps.keys()]) {
+      for (const id of [...nextStamps.keys()]) {
         if (!ctx.masks.has(id)) {
-          maskStamps.delete(id);
+          nextStamps.delete(id);
           if (!removedMaskIds.includes(id)) removedMaskIds.push(id);
         }
       }
     }
   }
 
-  return { masks, transferList, removedMaskIds };
+  return { masks, transferList, removedMaskIds, commitMaskStamps };
 }
 
 async function bufToBitmap(buf) {
@@ -167,26 +179,37 @@ async function runRenderJob(id, job) {
   if (job.layers) {
     stickyLayers = job.layers;
     layers = stickyLayers;
-  } else if (job.layerPatch && stickyLayers) {
+  } else if (job.layerPatch) {
     const patch = job.layerPatch;
-    const target = stickyLayers.find((l) => l.id === patch.id);
-    if (target) {
-      if (patch.enabled !== undefined) target.enabled = patch.enabled;
-      if (patch.opacity !== undefined) target.opacity = patch.opacity;
-      if (patch.blend !== undefined) target.blend = patch.blend;
-      if (patch.mask !== undefined) target.mask = patch.mask;
-      if (patch.maskInvert !== undefined) target.maskInvert = patch.maskInvert;
-      if (patch.maskFeather !== undefined) target.maskFeather = patch.maskFeather;
-      if (patch.params) {
-        // Full replace for slider patches; shallow merge for stroke-only paint.
-        if (patch.params.strokes != null && Object.keys(patch.params).length === 1) {
-          Object.assign(target.params, patch.params);
-        } else {
-          target.params = patch.params;
-        }
-      }
-      if (patch.mods) target.mods = patch.mods;
+    const target = stickyLayers?.find((l) => l.id === patch.id);
+    if (!target) {
+      // Main only patches while it believes our sticky DTO is its current
+      // stack, so a missing target proves that belief is wrong. Rendering the
+      // sticky stack anyway would drop the edit with no error — the failure
+      // that looked like brush strokes silently refusing to land, unrecoverable
+      // because every following patch preserved the same divergence. Fail loudly
+      // instead: the client keeps us alive and main resends a full stack.
+      const err = new Error(
+        `render worker: patch target ${patch.id} is not in the sticky stack`
+      );
+      err.code = ERR_STALE_PATCH;
+      throw err;
     }
+    if (patch.enabled !== undefined) target.enabled = patch.enabled;
+    if (patch.opacity !== undefined) target.opacity = patch.opacity;
+    if (patch.blend !== undefined) target.blend = patch.blend;
+    if (patch.mask !== undefined) target.mask = patch.mask;
+    if (patch.maskInvert !== undefined) target.maskInvert = patch.maskInvert;
+    if (patch.maskFeather !== undefined) target.maskFeather = patch.maskFeather;
+    if (patch.params) {
+      // Full replace for slider patches; shallow merge for stroke-only paint.
+      if (patch.params.strokes != null && Object.keys(patch.params).length === 1) {
+        Object.assign(target.params, patch.params);
+      } else {
+        target.params = patch.params;
+      }
+    }
+    if (patch.mods) target.mods = patch.mods;
     layers = stickyLayers;
   } else if (stickyLayers) {
     layers = stickyLayers;
@@ -285,7 +308,7 @@ async function runRenderJob(id, job) {
     });
   }
 
-  const { masks, transferList, removedMaskIds } = packMasks(ctx, {
+  const { masks, transferList, removedMaskIds, commitMaskStamps } = packMasks(ctx, {
     returnMasks: job.returnMasks,
     maskDeltas: !!job.maskDeltas,
     maskIds: job.maskIds ?? null,
@@ -293,6 +316,7 @@ async function runRenderJob(id, job) {
 
   // Paint-fast: main keeps the previous full-stack canvas; only masks.
   if (job.paintOnly) {
+    commitMaskStamps();
     self.postMessage(
       {
         type: MSG.RESULT,
@@ -329,6 +353,7 @@ async function runRenderJob(id, job) {
     return;
   }
 
+  commitMaskStamps();
   self.postMessage(
     {
       type: MSG.RESULT,
@@ -406,6 +431,7 @@ self.onmessage = async (ev) => {
               type: MSG.ERROR,
               id,
               message: err?.message || String(err),
+              code: err?.code ?? null,
             });
           }
         })();
@@ -420,6 +446,7 @@ self.onmessage = async (ev) => {
       type: MSG.ERROR,
       id: msg.id,
       message: err?.message || String(err),
+      code: err?.code ?? null,
     });
   }
 };

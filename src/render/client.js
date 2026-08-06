@@ -11,6 +11,7 @@
 
 import {
   MSG,
+  ERR_STALE_PATCH,
   layersToDTO,
   paintLayerPatch,
   layerLivePatch,
@@ -446,7 +447,9 @@ function makeWorkerClient(workerUrl, opts = {}) {
 
     if (msg.type === MSG.ERROR) {
       pending.delete(msg.id);
-      slot.reject(new Error(msg.message || "worker render failed"));
+      const err = new Error(msg.message || "worker render failed");
+      if (msg.code) err.code = msg.code;
+      slot.reject(err);
     }
   };
 
@@ -696,6 +699,12 @@ function makeResilientClient() {
       try {
         return await active.renderJob(job, hooks);
       } catch (err) {
+        // A stale patch means our sticky DTO diverged from the caller's stack —
+        // a bookkeeping desync, not a broken worker. Demoting the whole session
+        // to the main thread over it would be a permanent penalty for something
+        // one full-stack resend fixes, so keep the worker and let the caller
+        // retry. It owns the stack; we cannot rebuild a full job from a patch.
+        if (err?.code === ERR_STALE_PATCH) throw err;
         console.warn("[render] Worker job failed, main-thread retry:", err?.message || err);
         try {
           active.dispose?.();
@@ -724,4 +733,4 @@ export function decodeSource(drawable, w, h) {
   return bufFromDrawable(drawable, w, h);
 }
 
-export { workerSupported, createBuf, paintLayerPatch, layerLivePatch };
+export { workerSupported, createBuf, paintLayerPatch, layerLivePatch, ERR_STALE_PATCH };

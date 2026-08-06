@@ -16,6 +16,7 @@ import {
   paintLayerPatch,
   layerLivePatch,
   onRenderFontsLoaded,
+  ERR_STALE_PATCH,
 } from "./render/client.js";
 import { createLayerStack } from "./ui/layers.js";
 import { pickFile } from "./ui/controls.js";
@@ -294,6 +295,15 @@ function enqueuePreview() {
   previewChain = previewChain.then(() => renderPreview(seq)).catch((err) => {
     console.error(err);
     const msg = String(err?.message || err);
+    // The worker rejected a patch because its sticky DTO is not the stack we
+    // thought it held. It is still healthy — drop the claim and re-render with
+    // a full stack, which resyncs both sides. Must precede the /worker/ test
+    // below, whose message would also match.
+    if (err?.code === ERR_STALE_PATCH) {
+      state.workerLayerSig = null;
+      if (seq === previewSeq && state.image) scheduleRender();
+      return;
+    }
     if (/worker/i.test(msg)) {
       setStatus("Preview using main thread");
       // Worker path failed open — force a main-thread retry with a full payload.
@@ -549,6 +559,28 @@ async function renderPreview(seq) {
   // accounted for. A full DTO covers them by definition.
   clearDirtyLayers();
 
+  // The sticky DTO itself is adopted on receipt too, BEFORE the worker checks
+  // whether it has been superseded — so what it holds is decided by what we
+  // send, not by what comes back. This record has to be committed on send for
+  // the same reason.
+  //
+  // Recording it on the result instead skipped every aborted or superseded job,
+  // which mid-interaction is the normal case, and left the flag describing an
+  // older stack than the worker actually had. That stayed harmless only until
+  // the live stack returned to the signature we had recorded (reorder and
+  // reorder back, add a layer and delete it): from then on the flag read as
+  // fresh, every render became a one-layer patch against a stack the worker was
+  // not running, and paint patches whose target was missing from a truncated
+  // sticky DTO were dropped outright — brush strokes not landing, with nothing
+  // short of a reload to clear it.
+  //
+  // A patch leaves the sticky shape alone, so it keeps whatever we had. The
+  // paint fast-path sends only a PREFIX of the stack, which must never be
+  // marked authoritative — the layers above it would be lost.
+  if (!usePaintPatch && !useLivePatch) {
+    state.workerLayerSig = renderClient.supported && !paintFast ? stackSig : null;
+  }
+
   const result = await renderClient.renderJob(
     {
       mode: "preview",
@@ -595,6 +627,15 @@ async function renderPreview(seq) {
   // always forces sendSource.)
   if (sendSource) state.workerHasSource = true;
 
+  // Masks are the same kind of commitment as the source buffer: the worker
+  // records them as delivered the moment it posts them, so we have to take them
+  // even when this render turns out to be superseded. Dropping them left it
+  // believing we held fields we had never stored, and every later frame then
+  // reported those masks unchanged — the overlay frozen on a stale field with
+  // nothing to force a re-send. Merging a superseded job's masks is safe: both
+  // sides process results in order, so the current job's masks land after.
+  if (result) mergeMasks(result);
+
   if (seq !== previewSeq || state.rendering) {
     if (state.rendering) renderAfterExport = true;
     return;
@@ -614,15 +655,7 @@ async function renderPreview(seq) {
 
   previewRetries = 0;
 
-  // Full DTO landed on the worker (or local). Patches keep sticky.
-  // The paint fast-path sends only a PREFIX of the stack, so it must not leave
-  // the worker's DTO marked authoritative — the layers above would be lost.
-  if (!usePaintPatch && !useLivePatch) {
-    state.workerLayerSig = renderClient.supported && !paintFast ? stackSig : null;
-  }
-
   const ms = performance.now() - t0;
-  if (needMasks) mergeMasks(result);
   const painted = applyPreviewPixels(result);
   if (!painted && !result.paintOnly && state.previewSource) {
     // Missing bitmap/buffer — keep the stage honest with the decoded source.
